@@ -1056,7 +1056,7 @@ class MotorsBus(abc.ABC):
         motors: str | list[str] | None = None,
         *,
         normalize: bool = True,
-        num_retry: int = 0,
+        num_retry: int = 5,
     ) -> dict[str, Value]:
         """Read the same register from several motors at once.
 
@@ -1104,7 +1104,7 @@ class MotorsBus(abc.ABC):
         length: int,
         motor_ids: list[int],
         *,
-        num_retry: int = 0,
+        num_retry: int = 5,
         raise_on_error: bool = True,
         err_msg: str = "",
     ) -> tuple[dict[int, int], int]:
@@ -1122,6 +1122,8 @@ class MotorsBus(abc.ABC):
             raise ConnectionError(f"{err_msg} {self.packet_handler.getTxRxResult(comm)}")
 
         values = {id_: self.sync_reader.getData(id_, addr, length) for id_ in motor_ids}
+        for k, v in values.items():
+            values[k] = v % 4096
         return values, comm
 
     def _setup_sync_reader(self, motor_ids: list[int], addr: int, length: int) -> None:
@@ -1151,7 +1153,7 @@ class MotorsBus(abc.ABC):
         values: Value | dict[str, Value],
         *,
         normalize: bool = True,
-        num_retry: int = 0,
+        num_retry: int = 5,
     ) -> None:
         """Write the same register on multiple motors.
 

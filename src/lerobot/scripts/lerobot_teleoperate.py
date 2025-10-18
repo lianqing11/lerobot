@@ -130,7 +130,7 @@ def teleop_loop(
         robot_action_processor: An optional pipeline to process actions before they are sent to the robot.
         robot_observation_processor: An optional pipeline to process raw observations from the robot.
     """
-
+    display_data = True
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
 
@@ -154,7 +154,7 @@ def teleop_loop(
 
         # Send processed action to robot (robot_action_processor.to_output should return dict[str, Any])
         _ = robot.send_action(robot_action_to_send)
-
+        print("display_data: ", display_data)
         if display_data:
             # Process robot observation through pipeline
             obs_transition = robot_observation_processor(obs)

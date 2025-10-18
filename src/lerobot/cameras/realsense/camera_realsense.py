@@ -28,6 +28,7 @@ try:
     import pyrealsense2 as rs
 except Exception as e:
     logging.info(f"Could not import realsense: {e}")
+    rs = None  # Gracefully handle environments without pyrealsense2
 
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
@@ -126,8 +127,9 @@ class RealSenseCamera(Camera):
         self.use_depth = config.use_depth
         self.warmup_s = config.warmup_s
 
-        self.rs_pipeline: rs.pipeline | None = None
-        self.rs_profile: rs.pipeline_profile | None = None
+        # Note: Avoid referencing 'rs' types in annotations to prevent errors when pyrealsense2 is missing
+        self.rs_pipeline: object | None = None
+        self.rs_profile: object | None = None
 
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
@@ -165,6 +167,9 @@ class RealSenseCamera(Camera):
         """
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} is already connected.")
+
+        if rs is None:
+            raise ImportError("pyrealsense2 is not installed. Please install it to use RealSense cameras.")
 
         self.rs_pipeline = rs.pipeline()
         rs_config = rs.config()
@@ -206,6 +211,9 @@ class RealSenseCamera(Camera):
             OSError: If pyrealsense2 is not installed.
             ImportError: If pyrealsense2 is not installed.
         """
+        if rs is None:
+            raise ImportError("pyrealsense2 is not installed. Cannot search for RealSense cameras.")
+
         found_cameras_info = []
         context = rs.context()
         devices = context.query_devices()

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from tqdm import tqdm
 import contextlib
 import gc
 import logging
@@ -979,7 +980,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 None.
         """
         episode_buffer = episode_data if episode_data is not None else self.episode_buffer
-
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
         # size and task are special cases that won't be added to hf_dataset
@@ -1027,7 +1027,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 end_ep = self.num_episodes
                 self._batch_save_episode_video(start_ep, end_ep)
                 self.episodes_since_last_encoding = 0
-
         if not episode_data:
             # Reset episode buffer and clean up temporary images (if not already deleted during video encoding)
             self.clear_episode_buffer(delete_images=len(self.meta.image_keys) > 0)
@@ -1272,7 +1271,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         temp_path = Path(tempfile.mkdtemp(dir=self.root)) / f"{video_key}_{episode_index:03d}.mp4"
         img_dir = self._get_image_file_dir(episode_index, video_key)
         encode_video_frames(img_dir, temp_path, self.fps, overwrite=True)
-        shutil.rmtree(img_dir)
+        # shutil.rmtree(img_dir)
         return temp_path
 
     @classmethod
