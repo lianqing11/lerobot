@@ -1,0 +1,14 @@
+python -m lerobot.async_inference.robot_client \
+    --server_address=eez178.ece.ust.hk:8004 \
+    --robot.type=so101_follower \
+    --robot.port=/dev/tty.usbmodem5AB90657271 \
+    --robot.id=my_awesome_follower_arm \
+    --robot.cameras="{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+    --task="Water the first pot of flowers" \
+    --policy_type=act \
+    --pretrained_name_or_path=reedee123/act_so101_test020000 \
+    --policy_device=cpu \
+    --actions_per_chunk=50 \
+    --chunk_size_threshold=0.5 \
+    --aggregate_fn_name=weighted_average \
+    --debug_visualize_queue_size=True
