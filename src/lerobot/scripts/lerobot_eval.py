@@ -158,6 +158,9 @@ def rollout(
     check_env_attributes_and_types(env)
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
+        # Only do this if the observation has 'base_camera' at the top level (old ManiSkill format)
+        if 'base_camera' in observation and 'observation.images.base_camera' not in observation:
+            observation['observation.images.base_camera'] = observation['base_camera']
         observation = preprocess_observation(observation)
         if return_observations:
             all_observations.append(deepcopy(observation))
@@ -291,7 +294,7 @@ def eval_policy(
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
         if isinstance(env, gym.vector.SyncVectorEnv):
-            ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
+            ep_frames.append(np.stack([env.envs[i].render().cpu().numpy() for i in range(n_to_render_now)]))  # noqa: B023
         elif isinstance(env, gym.vector.AsyncVectorEnv):
             # Here we must render all frames and discard any we don't need.
             ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
