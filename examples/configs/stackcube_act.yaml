@@ -1,0 +1,51 @@
+# ACT Policy - StackCube-v2
+
+# Dataset
+dataset:
+  repo_id: lianqing11/stack_cube_lerobot
+  root: ./data/stackcube_v2_1k
+
+# Environment
+env:
+  type: maniskill
+  task: StackCube-v2  # 主训练任务
+  obs_mode: rgb
+  control_mode: pd_joint_pos
+  sim_backend: cpu
+  # 多任务评估：在训练过程中同时评估多个任务
+  eval_tasks:
+    - StackCube-pertube  # 扰动任务
+
+# Policy
+policy:
+  type: act
+  push_to_hub: false
+  # ACT parameters
+  chunk_size: 100
+  n_action_steps: 100
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+
+# Training
+steps: 100000
+batch_size: 8
+optimizer:
+  lr: 1.0e-5
+save_freq: 2000
+
+# Evaluation
+eval_freq: 2000
+eval:
+  n_episodes: 25
+  batch_size: 25
+
+# Logging
+wandb:
+  enable: true
+  project: maniskill_lerobot
+
+# Output
+output_dir: outputs/act

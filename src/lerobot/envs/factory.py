@@ -97,6 +97,7 @@ def make_env(
             n_envs=n_envs,
             gym_kwargs=cfg.gym_kwargs,
             env_cls=env_cls,
+            eval_tasks=getattr(cfg, 'eval_tasks', None),
         )
     package_name = f"gym_{cfg.type}"
     try:

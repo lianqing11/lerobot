@@ -19,21 +19,22 @@
 #     exit 1
 # fi
 
-DATASET_PATH=/VLA-Data/scripts/lianqing/projects/ManiSkill/mani_skill/trajectory/output/stackcube_v2_100
-rm -rf outputs/train/maniskill_stackcube/
+DATASET_PATH=/VLA-Data/scripts/lianqing/projects/ManiSkill/mani_skill/trajectory/output/stackcube_v2_1k
+date_time=$(date +'%Y-%m-%d_%H-%M')
+rm -rf outputs/train/maniskill_stackcube_{date_time}/
 # Configuration
 TASK="StackCube-v2"
 OBS_MODE="rgb"
-CONTROL_MODE="pd_ee_delta_pose"
+CONTROL_MODE="pd_joint_pos"
 POLICY_TYPE="act"
 STEPS=100000
 EVAL_FREQ=2000
 SAVE_FREQ=2000
-BATCH_SIZE=8
+BATCH_SIZE=128
 N_EVAL_EPISODES=10
 EVAL_BATCH_SIZE=10
 SIM_BACKEND="cpu"  # Change to "gpu" for faster evaluation
-OUTPUT_DIR="outputs/train/maniskill_stackcube"
+OUTPUT_DIR="outputs/train/maniskill_stackcube_${date_time}_${POLICY_TYPE}_${CONTROL_MODE}_${OBS_MODE}"
 
 echo "=========================================="
 echo "Training on ManiSkill StackCube-v1"

@@ -1,0 +1,50 @@
+# Model 2: Diffusion Policy for StackCube-v2
+# Diffusion-based policy learning
+
+experiment:
+  name: "stackcube_diffusion"
+  description: "Diffusion Policy on StackCube-v2"
+  tags: ["stackcube", "diffusion", "denoising"]
+
+dataset:
+  repo_id: "lianqing11/stack_cube_lerobot"
+  root: "/VLA-Data/scripts/lianqing/projects/ManiSkill/mani_skill/trajectory/output/stackcube_v2_1k"
+  
+env:
+  type: "maniskill"
+  task: "StackCube-v2"
+  obs_mode: "rgb"
+  control_mode: "pd_joint_pos"
+  sim_backend: "cpu"
+  
+policy:
+  type: "diffusion"
+  push_to_hub: false
+  # Diffusion specific parameters
+  horizon: 16
+  n_action_steps: 8
+  n_obs_steps: 2
+  num_inference_steps: 10
+  
+training:
+  steps: 100000
+  batch_size: 8
+  learning_rate: 1e-4
+  save_freq: 2000
+  
+eval:
+  enabled: true
+  freq: 2000
+  n_episodes: 10
+  batch_size: 10
+  
+wandb:
+  enable: true
+  project: "maniskill_lerobot"
+  tags: ["stackcube-v2", "diffusion"]
+  notes: "Diffusion Policy baseline"
+
+output:
+  base_dir: "outputs/train"
+  auto_timestamp: true
+

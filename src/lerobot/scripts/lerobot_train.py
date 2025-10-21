@@ -23,6 +23,9 @@ import torch
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
+import os.path as osp
+from datetime import datetime
+from pathlib import Path
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -141,6 +144,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
     """
     cfg.validate()
+    date_time = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    cfg.output_dir = f"{cfg.output_dir}_{cfg.env.task}_{date_time}"
+    cfg.output_dir = Path(cfg.output_dir)
+    cfg.wandb.run_id = osp.basename(cfg.output_dir)
+    logging.info(f"Output dir: {cfg.output_dir}")
+    logging.info(f"Wandb run id: {cfg.wandb.run_id}")
 
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
@@ -188,7 +197,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
-
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -324,7 +332,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         batch = next(dl_iter)
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
-
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,

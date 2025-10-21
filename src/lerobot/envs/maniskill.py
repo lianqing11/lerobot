@@ -37,38 +37,51 @@ def create_maniskill_envs(
     n_envs: int,
     gym_kwargs: dict,
     env_cls: type,
+    eval_tasks: list[str] | None = None,
 ) -> dict[str, dict[int, gym.vector.VectorEnv]]:
     """
     Create ManiSkill vectorized environments.
     
     Args:
-        task: Task name (e.g., "StackCube-v1")
+        task: Main task name (e.g., "StackCube-v2")
         n_envs: Number of parallel environments
         gym_kwargs: Additional kwargs for gym.make
         env_cls: Vector environment class (SyncVectorEnv or AsyncVectorEnv)
+        eval_tasks: Additional tasks to evaluate on (e.g., ["StackCube-pertube"])
+                   If None, only creates environment for the main task
     
     Returns:
         Dictionary mapping suite name to task_id to vectorized environment
+        Format: {suite_name: {task_id: vec_env}}
+        Example: {"maniskill": {0: vec_env_v2, 1: vec_env_pertube}}
     """
     
-    def _make_one():
-        """Create a single ManiSkill environment."""
-        env = gym.make(task, **gym_kwargs)
-        
-        # Wrap the environment to ensure compatibility with LeRobot
-        env = ManiSkillWrapper(env)
-        
-        return env
+    def _make_one_task(task_name: str, env_id: int):
+        """Create a factory function for a single task with deterministic env_id."""
+        def _make():
+            env = gym.make(task_name, **gym_kwargs)
+            env = ManiSkillWrapper(env, env_id=env_id)
+            return env
+        return _make
     
-    # Create vectorized environment
-    vec_env = env_cls(
-        [_make_one for _ in range(n_envs)],
+    suite_name = "maniskill"
+    envs_dict = {}
+    
+    # Create environment for main task
+    vec_env_main = env_cls(
+        [_make_one_task(task, env_id=i) for i in range(n_envs)],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP
     )
-    
-    # Return in the expected format: {suite_name: {task_id: vec_env}}
-    suite_name = "maniskill"
-    return {suite_name: {0: vec_env}}
+    envs_dict[task] = vec_env_main
+    # Create environments for additional eval tasks
+    if eval_tasks:
+        for task_id, eval_task in enumerate(eval_tasks, start=1):
+            vec_env = env_cls(
+                [_make_one_task(eval_task, env_id=i) for i in range(n_envs)],
+                autoreset_mode=gym.vector.AutoresetMode.SAME_STEP
+            )
+            envs_dict[eval_task] = vec_env
+    return {suite_name: envs_dict}
 
 
 class ManiSkillWrapper(gym.ObservationWrapper):
@@ -79,10 +92,14 @@ class ManiSkillWrapper(gym.ObservationWrapper):
     - Handles observation transformations
     - Adds success tracking to info dict
     - Ensures consistent observation/action space formats
+    - Provides deterministic cube_order for StackCube-pertube based on env_id
     """
     
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, env_id: int = 0):
         super().__init__(env)
+        
+        # Store env_id for deterministic initialization
+        self.env_id = env_id
         
         # Store observation mode for processing
         self.obs_mode = getattr(env.unwrapped, "obs_mode", "state")
@@ -115,10 +132,7 @@ class ManiSkillWrapper(gym.ObservationWrapper):
         
         # For pd_ee_delta_pose, ManiSkill expects 7D actions (3 pos + 4 quat)
         # LeRobot policies output 8D actions (7D pose + 1D gripper)
-        # Take only the first 7 dimensions
-        if isinstance(action, np.ndarray) and action.shape[-1] == 8:
-            action = action[..., :7]
-        
+
         # ManiSkill expects actions with shape (1, action_dim) - add batch dimension
         if isinstance(action, np.ndarray) and action.ndim == 1:
             action = action.reshape(1, -1)
@@ -256,7 +270,20 @@ class ManiSkillWrapper(gym.ObservationWrapper):
                 return gym.spaces.Dict({"observation": original_space})
     
     def reset(self, **kwargs):
-        """Reset the environment."""
+        """Reset the environment with deterministic cube_order for pertube tasks."""
+        # For StackCube-pertube, add deterministic cube_order based on env_id
+        task_name = getattr(self.env.unwrapped, "spec", None)
+        if task_name:
+            task_id = getattr(task_name, "id", "")
+            if "pertube" in task_id.lower():
+                # Set deterministic cube_order based on env_id
+                # This ensures each environment gets a different but consistent configuration
+                if "options" not in kwargs or kwargs["options"] is None:
+                    kwargs["options"] = {}
+                if "cube_order" not in kwargs.get("options", {}):
+                    # Use env_id as the cube_order for deterministic placement
+                    kwargs["options"]["cube_order"] = [self.env_id * 25]
+        
         obs, info = super().reset(**kwargs)
         
         # Initialize success tracking

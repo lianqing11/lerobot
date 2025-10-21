@@ -30,6 +30,9 @@ def write_video(video_path, stacked_frames, fps):
         warnings.filterwarnings(
             "ignore", "pkg_resources is deprecated as an API", category=DeprecationWarning
         )
+        if stacked_frames.ndim==5:
+            # For maniskill data, the dim is 5;
+            stacked_frames = stacked_frames.squeeze(1)
         imageio.mimsave(video_path, stacked_frames, fps=fps)
 
 

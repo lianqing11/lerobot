@@ -1,0 +1,51 @@
+# Model 3: SmoVLA for StackCube-v2
+# Small Vision-Language-Action Model
+
+experiment:
+  name: "stackcube_smolvla"
+  description: "SmoVLA (Small Vision-Language-Action) on StackCube-v2 with language instructions"
+  tags: ["stackcube", "vla", "smolvla", "language"]
+
+dataset:
+  repo_id: "lianqing11/stack_cube_lerobot"
+  root: "/VLA-Data/scripts/lianqing/projects/ManiSkill/mani_skill/trajectory/output/stackcube_v2_1k"
+  
+env:
+  type: "maniskill"
+  task: "StackCube-v2"
+  obs_mode: "rgb"
+  control_mode: "pd_joint_pos"
+  sim_backend: "cpu"
+  
+policy:
+  type: "tdmpc"  # Placeholder - 根据实际的policy type调整
+  push_to_hub: false
+  # SmoVLA specific parameters
+  use_language: true
+  vision_encoder: "resnet18"
+  language_encoder: "distilbert"
+  hidden_dim: 256
+  
+training:
+  steps: 100000
+  batch_size: 16  # VLA models might benefit from larger batch
+  learning_rate: 3e-4
+  save_freq: 2000
+  warmup_steps: 1000
+  
+eval:
+  enabled: true
+  freq: 2000
+  n_episodes: 10
+  batch_size: 10
+  
+wandb:
+  enable: true
+  project: "maniskill_lerobot"
+  tags: ["stackcube-v2", "smolvla", "vla"]
+  notes: "SmoVLA with language conditioning"
+
+output:
+  base_dir: "outputs/train"
+  auto_timestamp: true
+

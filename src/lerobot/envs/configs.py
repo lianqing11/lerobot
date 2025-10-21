@@ -325,6 +325,7 @@ class ManiSkillEnv(EnvConfig):
     camera_width: int = 128
     camera_height: int = 128
     num_envs: int = 1  # Number of parallel environments for GPU simulation
+    eval_tasks: list[str] | None = None  # Additional tasks to evaluate on (e.g., ["StackCube-pertube"])
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(8,)),
