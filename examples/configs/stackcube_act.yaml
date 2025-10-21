@@ -28,6 +28,7 @@ policy:
   dim_feedforward: 3200
   n_encoder_layers: 4
   n_decoder_layers: 1
+  pretrained_path: outputs/act_StackCube-v2_2025-10-21_09-49/checkpoints/014000/pretrained_model
 
 # Training
 steps: 100000

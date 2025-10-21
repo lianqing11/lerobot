@@ -398,15 +398,43 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]
 
-                # optional: per-suite logging
-                for suite, suite_info in eval_info.items():
-                    logging.info("Suite %s aggregated: %s", suite, suite_info)
+                # Log evaluation results with clean formatting
+                logging.info("=" * 60)
+                logging.info("Evaluation Results at Step %d", step)
+                logging.info("=" * 60)
+                
+                # Log overall metrics
+                logging.info("Overall:")
+                logging.info("  Success Rate: %.2f%% (%d/%d)", 
+                            aggregated["avg_pc_success"] * 100,
+                            aggregated["n_successes"],
+                            aggregated["n_episodes"])
+                logging.info("  Avg Sum Reward: %.3f", aggregated["avg_sum_reward"])
+                logging.info("  Avg Max Reward: %.3f", aggregated["avg_max_reward"])
+                logging.info("  Eval Time: %.2fs", aggregated["eval_s"])
+                
+                # Log per-task metrics
+                for task_name, task_info in eval_info.items():
+                    # Skip non-task keys
+                    if task_name in ["overall", "per_task"]:
+                        continue
+                    if isinstance(task_info, dict) and "avg_pc_success" in task_info:
+                        logging.info("")
+                        logging.info("%s:", task_name)
+                        logging.info("  Success Rate: %.2f%% (%d/%d)",
+                                    task_info["avg_pc_success"] * 100,
+                                    task_info["n_successes"],
+                                    task_info["n_episodes"])
+                        logging.info("  Avg Sum Reward: %.3f", task_info["avg_sum_reward"])
+                        logging.info("  Avg Max Reward: %.3f", task_info["avg_max_reward"])
+                
+                logging.info("=" * 60)
 
                 # meters/tracker
                 eval_metrics = {
                     "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
-                    "pc_success": AverageMeter("success", ":.1f"),
-                    "eval_s": AverageMeter("eval_s", ":.3f"),
+                    "success_rate": AverageMeter("success", ":.2%"),
+                    "eval_time_s": AverageMeter("eval_s", ":.3f"),
                 }
                 eval_tracker = MetricsTracker(
                     cfg.batch_size,
@@ -416,11 +444,39 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     initial_step=step,
                     accelerator=accelerator,
                 )
-                eval_tracker.eval_s = aggregated.pop("eval_s")
-                eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
-                eval_tracker.pc_success = aggregated.pop("pc_success")
+                # Don't pop - just read the values so they're still available for WandB
+                eval_tracker.eval_time_s = aggregated["eval_s"]
+                eval_tracker.avg_sum_reward = aggregated["avg_sum_reward"]
+                eval_tracker.success_rate = aggregated["avg_pc_success"]  # Use avg_pc_success (0-1 range)
+                
                 if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    # Build comprehensive WandB log dict with per-task metrics
+                    wandb_log_dict = eval_tracker.to_dict()
+                    
+                    # Add overall metrics with clear naming
+                    wandb_log_dict["eval_overall/success_rate"] = eval_info["overall"]["avg_pc_success"]
+                    wandb_log_dict["eval_overall/success_pct"] = eval_info["overall"]["pc_success"]
+                    wandb_log_dict["eval_overall/n_successes"] = eval_info["overall"]["n_successes"]
+                    wandb_log_dict["eval_overall/n_episodes"] = eval_info["overall"]["n_episodes"]
+                    wandb_log_dict["eval_overall/avg_sum_reward"] = eval_info["overall"]["avg_sum_reward"]
+                    wandb_log_dict["eval_overall/avg_max_reward"] = eval_info["overall"]["avg_max_reward"]
+                    wandb_log_dict["eval_overall/eval_time_s"] = eval_info["overall"]["eval_s"]
+                    
+                    # Add per-task metrics
+                    for key, value in eval_info.items():
+                        # Skip non-task keys
+                        if key in ["overall", "per_task"]:
+                            continue
+                        if isinstance(value, dict) and "avg_pc_success" in value:
+                            # Log metrics for this specific task
+                            task_prefix = f"eval_{key}"
+                            wandb_log_dict[f"{task_prefix}/success_rate"] = value["avg_pc_success"]
+                            wandb_log_dict[f"{task_prefix}/success_pct"] = value["pc_success"]
+                            wandb_log_dict[f"{task_prefix}/n_successes"] = value["n_successes"]
+                            wandb_log_dict[f"{task_prefix}/n_episodes"] = value["n_episodes"]
+                            wandb_log_dict[f"{task_prefix}/avg_sum_reward"] = value["avg_sum_reward"]
+                            wandb_log_dict[f"{task_prefix}/avg_max_reward"] = value["avg_max_reward"]
+                    
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 

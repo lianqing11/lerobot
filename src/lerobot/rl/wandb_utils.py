@@ -118,8 +118,8 @@ class WandBLogger:
     def log_dict(
         self, d: dict, step: int | None = None, mode: str = "train", custom_step_key: str | None = None
     ):
-        if mode not in {"train", "eval"}:
-            raise ValueError(mode)
+        # if mode not in {"train", "eval"}:
+        #     raise ValueError(mode)
         if step is None and custom_step_key is None:
             raise ValueError("Either step or custom_step_key must be provided.")
 
@@ -131,7 +131,10 @@ class WandBLogger:
         if custom_step_key is not None:
             if self._wandb_custom_step_key is None:
                 self._wandb_custom_step_key = set()
-            new_custom_key = f"{mode}/{custom_step_key}"
+            if "mode" == "":
+                new_custom_key = f"{custom_step_key}"
+            else:
+                new_custom_key = f"{mode}/{custom_step_key}"
             if new_custom_key not in self._wandb_custom_step_key:
                 self._wandb_custom_step_key.add(new_custom_key)
                 self._wandb.define_metric(new_custom_key, hidden=True)
@@ -149,11 +152,16 @@ class WandBLogger:
 
             if custom_step_key is not None:
                 value_custom_step = d[custom_step_key]
-                data = {f"{mode}/{k}": v, f"{mode}/{custom_step_key}": value_custom_step}
+                if "mode" == "":
+                    data = {f"{k}": v, f"{custom_step_key}": value_custom_step}
+                else:
+                    data = {f"{mode}/{k}": v, f"{mode}/{custom_step_key}": value_custom_step}
                 self._wandb.log(data)
                 continue
-
-            self._wandb.log(data={f"{mode}/{k}": v}, step=step)
+            if "mode" == "":
+                self._wandb.log(data={f"{k}": v}, step=step)
+            else:    
+                self._wandb.log(data={f"{mode}/{k}": v}, step=step)
 
     def log_video(self, video_path: str, step: int, mode: str = "train"):
         if mode not in {"train", "eval"}:

@@ -1,39 +1,42 @@
-# Pi0 - StackCube-v2
+# Pi0 Policy - StackCube-v2
 
 # Dataset
 dataset:
   repo_id: lianqing11/stack_cube_lerobot
-  root: /VLA-Data/scripts/lianqing/projects/ManiSkill/mani_skill/trajectory/output/stackcube_v2_1k
+  root: ./data/stackcube_v2_1k
 
 # Environment
 env:
   type: maniskill
-  task: StackCube-v2
+  task: StackCube-v2  # 主训练任务
   obs_mode: rgb
   control_mode: pd_joint_pos
   sim_backend: cpu
+  # 多任务评估：在训练过程中同时评估多个任务
+  eval_tasks:
+    - StackCube-pertube  # 扰动任务
 
-# Policy (需要根据实际实现调整)
+# Policy
 policy:
-  type: tdmpc  # 待确认
+  type: pi0
   push_to_hub: false
   # Pi0 parameters
-  use_language: true
-  vision_backbone: vit-base
-  action_head: diffusion
-  chunk_size: 50
+  # Optimizer settings
+  compile_model: true
+  pretrained_path: lerobot/pi0_base
+  scheduler_decay_lr: 2.5e-6
+  gradient_checkpointing: true
 
 # Training
-steps: 150000
+steps: 3000
 batch_size: 32
-learning_rate: 1.0e-4
-save_freq: 2000
+save_freq: 1000
 
 # Evaluation
-eval_freq: 2000
+eval_freq: 1000
 eval:
-  n_episodes: 10
-  batch_size: 10
+  n_episodes: 25
+  batch_size: 25
 
 # Logging
 wandb:
@@ -41,4 +44,4 @@ wandb:
   project: maniskill_lerobot
 
 # Output
-output_dir: outputs/train/StackCube-v2/pi0
+output_dir: outputs/pi0

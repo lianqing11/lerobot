@@ -1,51 +1,65 @@
-# Model 3: SmoVLA for StackCube-v2
+# SmoVLA Policy - StackCube-v2
 # Small Vision-Language-Action Model
 
-experiment:
-  name: "stackcube_smolvla"
-  description: "SmoVLA (Small Vision-Language-Action) on StackCube-v2 with language instructions"
-  tags: ["stackcube", "vla", "smolvla", "language"]
-
+# Dataset
 dataset:
-  repo_id: "lianqing11/stack_cube_lerobot"
-  root: "/VLA-Data/scripts/lianqing/projects/ManiSkill/mani_skill/trajectory/output/stackcube_v2_1k"
-  
+  repo_id: lianqing11/stack_cube_lerobot
+  root: ./data/stackcube_v2_1k
+
+# Environment
 env:
-  type: "maniskill"
-  task: "StackCube-v2"
-  obs_mode: "rgb"
-  control_mode: "pd_joint_pos"
-  sim_backend: "cpu"
-  
+  type: maniskill
+  task: StackCube-v2  # 主训练任务
+  obs_mode: rgb
+  control_mode: pd_joint_pos
+  sim_backend: cpu
+  # 多任务评估：在训练过程中同时评估多个任务
+  eval_tasks:
+    - StackCube-pertube  # 扰动任务
+
+# Policy
 policy:
-  type: "tdmpc"  # Placeholder - 根据实际的policy type调整
+  type: smolvla
   push_to_hub: false
-  # SmoVLA specific parameters
-  use_language: true
-  vision_encoder: "resnet18"
-  language_encoder: "distilbert"
-  hidden_dim: 256
-  
-training:
-  steps: 100000
-  batch_size: 16  # VLA models might benefit from larger batch
-  learning_rate: 3e-4
-  save_freq: 2000
-  warmup_steps: 1000
-  
+  # SmoVLA parameters
+  chunk_size: 50
+  n_action_steps: 50
+  max_state_dim: 32
+  max_action_dim: 32
+  # VLM settings
+  vlm_model_name: HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+  load_vlm_weights: false
+  # Finetuning settings
+  freeze_vision_encoder: true
+  train_expert_only: true
+  train_state_proj: true
+  # Optimizer settings
+  optimizer_lr: 1.0e-4
+  optimizer_betas: [0.9, 0.95]
+  optimizer_eps: 1.0e-8
+  optimizer_weight_decay: 1.0e-10
+  optimizer_grad_clip_norm: 10.0
+  # Scheduler settings
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+  scheduler_decay_lr: 2.5e-6
+  pretrained_path: lerobot/smolvla_base`
+
+# Training
+steps: 100000
+batch_size: 8
+save_freq: 2000
+
+# Evaluation
+eval_freq: 2000
 eval:
-  enabled: true
-  freq: 2000
-  n_episodes: 10
-  batch_size: 10
-  
+  n_episodes: 25
+  batch_size: 25
+
+# Logging
 wandb:
   enable: true
-  project: "maniskill_lerobot"
-  tags: ["stackcube-v2", "smolvla", "vla"]
-  notes: "SmoVLA with language conditioning"
+  project: maniskill_lerobot
 
-output:
-  base_dir: "outputs/train"
-  auto_timestamp: true
-
+# Output
+output_dir: outputs/smolvla

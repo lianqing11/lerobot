@@ -1,54 +1,46 @@
-# Model 5: Pi0.5 for StackCube-v2
-# Physical Intelligence Pi0.5 model (improved version)
+# Pi0.5 Policy - StackCube-v2
 
-experiment:
-  name: "stackcube_pi0_5"
-  description: "Pi0.5 (Physical Intelligence v0.5) on StackCube-v2"
-  tags: ["stackcube", "pi0.5", "vla", "latest"]
-
+# Dataset
 dataset:
-  repo_id: "lianqing11/stack_cube_lerobot"
-  root: "/VLA-Data/scripts/lianqing/projects/ManiSkill/mani_skill/trajectory/output/stackcube_v2_1k"
-  
+  repo_id: lianqing11/stack_cube_lerobot
+  root: ./data/stackcube_v2_1k
+
+# Environment
 env:
-  type: "maniskill"
-  task: "StackCube-v2"
-  obs_mode: "rgb"
-  control_mode: "pd_joint_pos"
-  sim_backend: "cpu"
-  
+  type: maniskill
+  task: StackCube-v2  # 主训练任务
+  obs_mode: rgb
+  control_mode: pd_joint_pos
+  sim_backend: cpu
+  # 多任务评估：在训练过程中同时评估多个任务
+  eval_tasks:
+    - StackCube-pertube  # 扰动任务
+
+# Policy
 policy:
-  type: "tdmpc"  # Placeholder - 根据实际的policy type调整
+  type: pi05
   push_to_hub: false
-  # Pi0.5 specific parameters
-  use_language: true
-  vision_backbone: "vit-large"
-  language_model: "phi-2"
-  action_head: "flow_matching"
-  chunk_size: 64
-  use_proprio: true
-  
-training:
-  steps: 150000
-  batch_size: 32
-  learning_rate: 5e-5
-  save_freq: 2000
-  gradient_accumulation_steps: 4
-  mixed_precision: "fp16"
-  
+  # Pi0.5 parameters
+  # Scheduler settings
+  scheduler_decay_steps: 3000
+  scheduler_decay_lr: 2.5e-6
+  pretrained_path: lerobot/pi05_base
+
+# Training
+steps: 6000
+batch_size: 32
+save_freq: 1000
+
+# Evaluation
+eval_freq: 1000
 eval:
-  enabled: true
-  freq: 2000
-  n_episodes: 10
-  batch_size: 10
-  
+  n_episodes: 25
+  batch_size: 25
+
+# Logging
 wandb:
   enable: true
-  project: "maniskill_lerobot"
-  tags: ["stackcube-v2", "pi0.5"]
-  notes: "Pi0.5 improved version"
+  project: maniskill_lerobot
 
-output:
-  base_dir: "outputs/train"
-  auto_timestamp: true
-
+# Output
+output_dir: outputs/pi0_5

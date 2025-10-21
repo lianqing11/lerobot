@@ -174,7 +174,7 @@ def rollout(
         action = postprocessor(action)
 
         # Convert to CPU / numpy.
-        action_numpy: np.ndarray = action.to("cpu").numpy()
+        action_numpy: np.ndarray = action.float().to("cpu").numpy()
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
 
         # Apply the next action.
@@ -192,6 +192,7 @@ def rollout(
                     "You're likely using an older version of gymnasium (< 1.0). Please upgrade."
                 )
             successes = final_info["is_success"].tolist()
+            successes = [i if i is not None else False for i in successes]
         else:
             successes = [False] * env.num_envs
 
@@ -525,13 +526,33 @@ def eval_main(cfg: EvalPipelineConfig):
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
         )
+        print("\n" + "=" * 60)
         print("Overall Aggregated Metrics:")
-        print(info["overall"])
+        print("=" * 60)
+        print(f"Average Success Rate: {info['overall']['avg_pc_success']:.2%}")
+        print(f"Success Rate (×100): {info['overall']['pc_success']:.2f}%")
+        print(f"Successes: {info['overall']['n_successes']}/{info['overall']['n_episodes']}")
+        print(f"Average Sum Reward: {info['overall']['avg_sum_reward']:.3f}")
+        print(f"Average Max Reward: {info['overall']['avg_max_reward']:.3f}")
+        print(f"Total Time: {info['overall']['eval_s']:.2f}s")
 
-        # Print per-suite stats
-        for task_group, task_group_info in info.items():
-            print(f"\nAggregated Metrics for {task_group}:")
-            print(task_group_info)
+        # Print per-task stats
+        print("\n" + "=" * 60)
+        print("Per-Task Metrics:")
+        print("=" * 60)
+        for key, value in info.items():
+            # Skip non-task keys
+            if key in ["overall", "per_task"]:
+                continue
+            if isinstance(value, dict) and "avg_pc_success" in value:
+                print(f"\n{key}:")
+                print(f"  Success Rate: {value['avg_pc_success']:.2%}")
+                print(f"  Success Rate (×100): {value['pc_success']:.2f}%")
+                print(f"  Successes: {value['n_successes']}/{value['n_episodes']}")
+                print(f"  Average Sum Reward: {value['avg_sum_reward']:.3f}")
+                print(f"  Average Max Reward: {value['avg_max_reward']:.3f}")
+                print(f"  Episodes: {value['n_episodes']}")
+        print("=" * 60)
     # Close all vec envs
     close_envs(envs)
 
@@ -654,16 +675,17 @@ def eval_policy_all(
     """
     start_t = time.time()
 
-    # Flatten envs into list of (task_group, task_id, env)
-    tasks = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
+    # Flatten envs into list of (task_group, task_name, env)
+    # task_name is the actual task (e.g., "StackCube-v2", "StackCube-pertube")
+    tasks = [(tg, task_name, vec) for tg, group in envs.items() for task_name, vec in group.items()]
 
-    # accumulators: track metrics at both per-group level and across all groups
-    group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
+    # accumulators: track metrics by task name and overall
+    task_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
     overall: dict[str, list] = {k: [] for k in ACC_KEYS}
     per_task_infos: list[dict] = []
 
     # small inline helper to accumulate one task's metrics into accumulators
-    def _accumulate_to(group: str, metrics: dict):
+    def _accumulate_to(task_name: str, metrics: dict):
         # metrics expected to contain 'sum_rewards', 'max_rewards', 'successes', optionally 'video_paths'
         # but eval_one may store per-episode lists; we assume metrics uses scalars averaged per task as before.
         # To be robust, accept scalars or lists.
@@ -671,10 +693,10 @@ def eval_policy_all(
             if value is None:
                 return
             if isinstance(value, list):
-                group_acc[group][key].extend(value)
+                task_acc[task_name][key].extend(value)
                 overall[key].extend(value)
             else:
-                group_acc[group][key].append(value)
+                task_acc[task_name][key].append(value)
                 overall[key].append(value)
 
         _append("sum_rewards", metrics.get("sum_rewards"))
@@ -683,7 +705,7 @@ def eval_policy_all(
         # video_paths is list-like
         paths = metrics.get("video_paths", [])
         if paths:
-            group_acc[group]["video_paths"].extend(paths)
+            task_acc[task_name]["video_paths"].extend(paths)
             overall["video_paths"].extend(paths)
 
     # Choose runner (sequential vs threaded)
@@ -702,21 +724,23 @@ def eval_policy_all(
     if max_parallel_tasks <= 1:
         # sequential path (single accumulator path on the main thread)
         # NOTE: keeping a single-threaded accumulator avoids concurrent list appends or locks
-        for task_group, task_id, env in tasks:
-            tg, tid, metrics = task_runner(task_group, task_id, env)
-            _accumulate_to(tg, metrics)
-            per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+        for task_group, task_name, env in tasks:
+            tg, task_id, metrics = task_runner(task_group, task_name, env)
+            # Use task_name (actual task like "StackCube-v2") for grouping
+            _accumulate_to(task_name, metrics)
+            per_task_infos.append({"task_group": tg, "task_name": task_name, "task_id": task_id, "metrics": metrics})
     else:
         # threaded path: submit all tasks, consume completions on main thread and accumulate there
         with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
             fut2meta = {}
-            for task_group, task_id, env in tasks:
-                fut = executor.submit(task_runner, task_group, task_id, env)
-                fut2meta[fut] = (task_group, task_id)
+            for task_group, task_name, env in tasks:
+                fut = executor.submit(task_runner, task_group, task_name, env)
+                fut2meta[fut] = (task_group, task_name)
             for fut in cf.as_completed(fut2meta):
-                tg, tid, metrics = fut.result()
-                _accumulate_to(tg, metrics)
-                per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                tg, task_id, metrics = fut.result()
+                # task_id here is the task_name we passed in
+                _accumulate_to(task_id, metrics)
+                per_task_infos.append({"task_group": tg, "task_name": task_id, "task_id": task_id, "metrics": metrics})
 
     # compute aggregated metrics helper (robust to lists/scalars)
     def _agg_from_list(xs):
@@ -725,33 +749,47 @@ def eval_policy_all(
         arr = np.array(xs, dtype=float)
         return float(np.nanmean(arr))
 
-    # compute per-group aggregates
-    groups_aggregated = {}
-    for group, acc in group_acc.items():
-        groups_aggregated[group] = {
+    # compute per-task aggregates (by actual task name)
+    tasks_aggregated = {}
+    for task_name, acc in task_acc.items():
+        successes_list = acc["successes"]
+        tasks_aggregated[task_name] = {
             "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
             "avg_max_reward": _agg_from_list(acc["max_rewards"]),
-            "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
+            "avg_pc_success": _agg_from_list(successes_list),
+            "pc_success": _agg_from_list(successes_list) * 100 if successes_list else float("nan"),
             "n_episodes": len(acc["sum_rewards"]),
+            "n_successes": int(sum(successes_list)) if successes_list else 0,
+            "successes": successes_list,  # Individual episode success (True/False)
+            "sum_rewards": acc["sum_rewards"],  # Individual episode rewards
+            "max_rewards": acc["max_rewards"],  # Individual episode max rewards
             "video_paths": list(acc["video_paths"]),
         }
 
     # overall aggregates
+    overall_successes = overall["successes"]
     overall_agg = {
         "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
         "avg_max_reward": _agg_from_list(overall["max_rewards"]),
-        "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
+        "avg_pc_success": _agg_from_list(overall_successes),
+        "pc_success": _agg_from_list(overall_successes) * 100 if overall_successes else float("nan"),
         "n_episodes": len(overall["sum_rewards"]),
+        "n_successes": int(sum(overall_successes)) if overall_successes else 0,
+        "successes": overall_successes,  # All individual episode successes
         "eval_s": time.time() - start_t,
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
         "video_paths": list(overall["video_paths"]),
     }
 
-    return {
+    # Build result dict with task names as top-level keys
+    result = {
         "per_task": per_task_infos,
-        "per_group": groups_aggregated,
         "overall": overall_agg,
     }
+    # Add each task's metrics as a top-level key
+    result.update(tasks_aggregated)
+    
+    return result
 
 
 def main():
