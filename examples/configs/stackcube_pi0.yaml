@@ -36,7 +36,7 @@ save_freq: 1000
 eval_freq: 1000
 eval:
   n_episodes: 25
-  batch_size: 25
+  batch_size: 32
 
 # Logging
 wandb:

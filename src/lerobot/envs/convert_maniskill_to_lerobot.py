@@ -359,17 +359,19 @@ def calculate_statistics(
     combined_df = pd.concat(all_dataframes, ignore_index=True)
     stats = {}
     
-    # Calculate action statistics
+    # Calculate action statistics (including quantiles for Pi0.5/VLA models)
     actions = np.stack(combined_df['action'].values)
     stats['action'] = {
         'mean': actions.mean(axis=0).tolist(),
         'std': actions.std(axis=0).tolist(),
         'max': actions.max(axis=0).tolist(),
         'min': actions.min(axis=0).tolist(),
+        'q01': np.percentile(actions, 1, axis=0).tolist(),  # 1st percentile for QUANTILES normalization
+        'q99': np.percentile(actions, 99, axis=0).tolist(),  # 99th percentile for QUANTILES normalization
         'count': [len(actions)]
     }
     
-    # Calculate state statistics
+    # Calculate state statistics (including quantiles for Pi0.5/VLA models)
     if has_state and 'observation.state' in combined_df:
         states = np.stack(combined_df['observation.state'].values)
         stats['observation.state'] = {
@@ -377,6 +379,8 @@ def calculate_statistics(
             'std': states.std(axis=0).tolist(),
             'max': states.max(axis=0).tolist(),
             'min': states.min(axis=0).tolist(),
+            'q01': np.percentile(states, 1, axis=0).tolist(),  # 1st percentile for QUANTILES normalization
+            'q99': np.percentile(states, 99, axis=0).tolist(),  # 99th percentile for QUANTILES normalization
             'count': [len(states)]
         }
     
