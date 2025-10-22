@@ -21,7 +21,6 @@ policy:
   type: pi05
   push_to_hub: false
   # Pi0.5 parameters
-  image_resolution: [224, 224]  # Image input size (height, width) - default is 224x224
   # Scheduler settings
   scheduler_decay_steps: 3000
   scheduler_decay_lr: 2.5e-6
@@ -40,7 +39,7 @@ save_freq: 1000
 eval_freq: 1000
 eval:
   n_episodes: 25
-  batch_size: 32
+  batch_size: 25
 
 # Logging
 wandb:

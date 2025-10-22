@@ -26,6 +26,9 @@ policy:
   pretrained_path: lerobot/pi0_base
   scheduler_decay_lr: 2.5e-6
   gradient_checkpointing: true
+  compile_model: true
+  dtype: bfloat16
+  device: cuda
 
 # Training
 steps: 3000

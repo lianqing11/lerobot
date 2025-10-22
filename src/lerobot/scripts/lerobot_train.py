@@ -477,7 +477,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                             wandb_log_dict[f"{task_prefix}/avg_sum_reward"] = value["avg_sum_reward"]
                             wandb_log_dict[f"{task_prefix}/avg_max_reward"] = value["avg_max_reward"]
                     
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
+                    wandb_logger.log_dict(wandb_log_dict, step, mode="")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
