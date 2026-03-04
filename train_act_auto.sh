@@ -32,7 +32,7 @@ fi
 
 dataset_repo_id="$(basename "${dataset_root}")"
 job_name="${dataset_repo_id}"
-output_dir="ckpt/${dataset_repo_id}"
+output_dir="ckpt/${dataset_repo_id}_$(date +%Y%m%d_%H%M%S)"
 
 # Detect available GPUs
 num_gpus=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0)

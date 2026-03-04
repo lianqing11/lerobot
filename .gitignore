@@ -178,3 +178,4 @@ outputs/
 *.xml
 *.part
 ckpt
+eval_outputs

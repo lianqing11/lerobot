@@ -156,12 +156,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
+        rename_map = policy_specs.rename_map if policy_specs.rename_map is not None else {}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,
             preprocessor_overrides={
                 "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+                "rename_observations_processor": {"rename_map": rename_map},
             },
             postprocessor_overrides={"device_processor": device_override},
         )
@@ -177,18 +178,27 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         client_id = context.peer()
         self.logger.debug(f"Receiving observations from {client_id}")
 
-        receive_time = time.time()  # comparing timestamps so need time.time()
-        start_deserialize = time.perf_counter()
+        start_receive = time.perf_counter()
         received_bytes = receive_bytes_in_chunks(
             request_iterator, None, self.shutdown_event, self.logger
         )  # blocking call while looping over request_iterator
+        receive_time = time.time()  # wall clock when image received
+        receive_duration_ms = (time.perf_counter() - start_receive) * 1000
+
+        start_deserialize = time.perf_counter()
         timed_observation = pickle.loads(received_bytes)  # nosec
         deserialize_time = time.perf_counter() - start_deserialize
 
-        self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
-
         obs_timestep = timed_observation.get_timestep()
         obs_timestamp = timed_observation.get_timestamp()
+        one_way_latency_ms = (receive_time - obs_timestamp) * 1000
+        self.logger.info(
+            f"Obs #{obs_timestep} received | "
+            f"receive={receive_duration_ms:.1f}ms deserialize={deserialize_time*1000:.1f}ms "
+            f"one_way_latency={one_way_latency_ms:.1f}ms"
+        )
+
+        self.logger.debug(f"Received observation #{obs_timestep}")
 
         # Calculate FPS metrics
         fps_metrics = self.fps_tracker.calculate_fps_metrics(obs_timestamp)
@@ -242,15 +252,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             actions = services_pb2.Actions(data=actions_bytes)
 
             self.logger.info(
-                f"Action chunk #{obs.get_timestep()} generated | "
-                f"Total time: {(inference_time + serialize_time) * 1000:.2f}ms"
-            )
-
-            self.logger.debug(
-                f"Action chunk #{obs.get_timestep()} generated | "
-                f"Inference time: {inference_time:.2f}s |"
-                f"Serialize time: {serialize_time:.2f}s |"
-                f"Total time: {inference_time + serialize_time:.2f}s"
+                f"Action chunk #{obs.get_timestep()} | "
+                f"predict={inference_time*1000:.1f}ms serialize={serialize_time*1000:.1f}ms "
+                f"total={(inference_time + serialize_time)*1000:.1f}ms"
             )
 
             time.sleep(
@@ -358,9 +362,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation)
         inference_time = time.perf_counter() - start_inference
-        self.logger.info(
-            f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
-        )
 
         """4. Apply postprocessor"""
         # Apply postprocessor (handles unnormalization and device movement)
@@ -387,19 +388,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess
+        total_time_ms = 1000 * (postprocess_stops - start_prepare)
 
         self.logger.info(
-            f"Observation {observation_t.get_timestep()} | "
-            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
-        )
-
-        self.logger.debug(
-            f"Observation {observation_t.get_timestep()} | "
-            f"Prepare time: {1000 * prepare_time:.2f}ms | "
-            f"Preprocessing time: {1000 * preprocessing_time:.2f}ms | "
-            f"Inference time: {1000 * inference_time:.2f}ms | "
-            f"Postprocessing time: {1000 * postprocessing_time:.2f}ms | "
-            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
+            f"Obs #{observation_t.get_timestep()} | "
+            f"prepare={1000*prepare_time:.1f}ms preprocess={1000*preprocessing_time:.1f}ms "
+            f"inference={1000*inference_time:.1f}ms postprocess={1000*postprocessing_time:.1f}ms "
+            f"total={total_time_ms:.1f}ms | action_shape={action_tensor.shape}"
         )
 
         return action_chunk
