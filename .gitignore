@@ -167,6 +167,10 @@ wandb/
 data/
 outputs/
 
+# Checkpoints & evaluation outputs
+ckpt/
+eval_outputs/
+
 # Translations
 *.mo
 *.pot
@@ -177,3 +181,6 @@ outputs/
 *.urdf
 *.xml
 *.part
+transformers_lerobot/
+CLAUDE.md
+*txt

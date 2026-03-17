@@ -129,8 +129,8 @@ class TrainPipelineConfig(HubMixin):
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
 
-        if isinstance(self.dataset.repo_id, list):
-            raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+        if isinstance(self.dataset.repo_id, list) and self.dataset.streaming:
+            raise NotImplementedError("Streaming is not supported for multi-dataset training.")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
@@ -144,9 +144,10 @@ class TrainPipelineConfig(HubMixin):
             )
 
         if self.use_rabc and not self.rabc_progress_path:
-            # Auto-detect from dataset path
+            if isinstance(self.dataset.repo_id, list):
+                raise ValueError("rabc_progress_path must be explicitly set for multi-dataset training.")
             repo_id = self.dataset.repo_id
-            if self.dataset.root:
+            if self.dataset.root and isinstance(self.dataset.root, str):
                 self.rabc_progress_path = str(Path(self.dataset.root) / "sarm_progress.parquet")
             else:
                 self.rabc_progress_path = f"hf://datasets/{repo_id}/sarm_progress.parquet"

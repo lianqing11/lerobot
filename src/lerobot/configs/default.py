@@ -15,26 +15,89 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.datasets.transforms import ImageTransformsConfig
 from lerobot.datasets.video_utils import get_safe_default_codec
 
 
+def _parse_dataset_list_file(filepath: str) -> tuple[list[str], list[str]]:
+    """Parse a text file listing dataset paths (one per line).
+
+    Returns (repo_ids, roots) where repo_id is derived from the directory basename.
+    Lines starting with '#' and empty lines are ignored.
+    Each line can be:
+      - A dataset root path: ``/data/pick_cup``  -> repo_id="pick_cup", root="/data/pick_cup"
+      - repo_id and root separated by whitespace: ``pick_cup /data/pick_cup``
+    """
+    path = Path(filepath)
+    if not path.is_file():
+        raise FileNotFoundError(f"dataset_list_file not found: {filepath}")
+
+    repo_ids: list[str] = []
+    roots: list[str] = []
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) == 1:
+            root_path = parts[0].rstrip("/")
+            repo_id = Path(root_path).name
+            roots.append(root_path)
+            repo_ids.append(repo_id)
+        elif len(parts) == 2:
+            repo_ids.append(parts[0])
+            roots.append(parts[1].rstrip("/"))
+        else:
+            raise ValueError(
+                f"Invalid line in dataset list file: '{raw_line}'. "
+                "Expected either a single path or 'repo_id path'."
+            )
+
+    if not repo_ids:
+        raise ValueError(f"No datasets found in {filepath}")
+    return repo_ids, roots
+
+
 @dataclass
 class DatasetConfig:
-    # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
-    # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
-    # "dataset_index" into the returned item. The index mapping is made according to the order in which the
-    # datasets are provided.
-    repo_id: str
-    # Root directory where the dataset will be stored (e.g. 'dataset/path'). If None, defaults to $HF_LEROBOT_HOME/repo_id.
-    root: str | None = None
-    episodes: list[int] | None = None
+    # You may provide a single repo_id (str) or a list of repo_ids (list[str]).
+    # When a list is provided, train.py creates all datasets and concatenates them via
+    # MultiLeRobotDataset. Only data keys common across all datasets are kept. Each dataset
+    # gets an additional "dataset_index" field in returned items.
+    repo_id: str | list[str] = ""
+    # Root directory where the dataset will be stored (e.g. 'dataset/path').
+    # For multi-dataset: provide a list of roots matching repo_id order, or a single
+    # shared parent directory. If None, defaults to $HF_LEROBOT_HOME/repo_id.
+    root: str | list[str] | None = None
+    # Path to a text file listing multiple datasets (one per line).
+    # Each line is either a dataset root path, or "repo_id root_path" separated by whitespace.
+    # Lines starting with '#' and blank lines are ignored.
+    # When set, this overrides repo_id and root with the parsed values.
+    dataset_list_file: str | None = None
+    # For single dataset: list[int] of episode indices.
+    # For multi-dataset: dict mapping repo_id -> list[int], or None to use all episodes.
+    episodes: list[int] | dict[str, list[int]] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dataset_list_file is not None:
+            repo_ids, roots = _parse_dataset_list_file(self.dataset_list_file)
+            if len(repo_ids) == 1:
+                self.repo_id = repo_ids[0]
+                self.root = roots[0]
+            else:
+                self.repo_id = repo_ids
+                self.root = roots
+        if not self.repo_id:
+            raise ValueError(
+                "No dataset specified. Provide either 'repo_id' or 'dataset_list_file'."
+            )
 
 
 @dataclass

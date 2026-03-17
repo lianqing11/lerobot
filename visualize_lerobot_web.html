@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LeRobot Dataset Visualizer</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242836;
+    --border: #2e3348;
+    --text: #e4e6f0;
+    --text2: #9096b0;
+    --accent: #6c7eff;
+    --accent-hover: #8b94ff;
+    --success: #4ade80;
+    --warn: #fbbf24;
+    --danger: #f87171;
+    --radius: 10px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); }
+
+  /* ── Header ── */
+  .header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 28px;
+    display: flex; align-items: center; gap: 16px;
+    position: sticky; top: 0; z-index: 100;
+  }
+  .header h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
+  .header .meta { font-size: 13px; color: var(--text2); margin-left: auto; display: flex; gap: 20px; }
+  .header .meta span { display: flex; align-items: center; gap: 5px; }
+  .badge { background: var(--accent); color: #fff; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 20px; }
+
+  /* ── Layout ── */
+  .container { display: flex; height: calc(100vh - 57px); }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    width: 360px; min-width: 360px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .sidebar-header {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .sidebar-header h2 { font-size: 14px; font-weight: 600; }
+  .search-box {
+    display: flex; gap: 8px;
+  }
+  .search-box input {
+    flex: 1;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    color: var(--text);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .search-box input:focus { border-color: var(--accent); }
+  .filter-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .filter-chip {
+    font-size: 11px; padding: 4px 10px;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 20px; cursor: pointer; color: var(--text2);
+    transition: all 0.2s; white-space: nowrap;
+  }
+  .filter-chip:hover, .filter-chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  .episode-list {
+    flex: 1; overflow-y: auto;
+    padding: 8px;
+  }
+  .episode-list::-webkit-scrollbar { width: 6px; }
+  .episode-list::-webkit-scrollbar-track { background: transparent; }
+  .episode-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .ep-card {
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 2px;
+  }
+  .ep-card:hover { background: var(--surface2); }
+  .ep-card.selected { background: var(--accent); color: #fff; }
+  .ep-card.selected .ep-meta { color: rgba(255,255,255,0.7); }
+  .ep-card .ep-idx {
+    font-weight: 700; font-size: 14px; min-width: 36px; text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .ep-card .ep-info { flex: 1; overflow: hidden; }
+  .ep-card .ep-task {
+    font-size: 13px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .ep-card .ep-meta { font-size: 11px; color: var(--text2); margin-top: 2px; }
+
+  /* ── Batch bar ── */
+  .batch-bar {
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--surface2);
+    display: none;
+    flex-direction: column; gap: 8px;
+  }
+  .batch-bar.visible { display: flex; }
+  .batch-bar .batch-info { font-size: 12px; color: var(--text2); }
+  .batch-bar .batch-actions { display: flex; gap: 8px; }
+
+  /* ── Main content ── */
+  .main { flex: 1; overflow-y: auto; padding: 24px 28px; }
+  .main::-webkit-scrollbar { width: 6px; }
+  .main::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .empty-state {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100%; color: var(--text2); gap: 12px;
+  }
+  .empty-state svg { opacity: 0.3; }
+  .empty-state p { font-size: 15px; }
+
+  .detail-header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+  .detail-header h2 { font-size: 22px; font-weight: 700; }
+  .detail-header .ep-len { font-size: 13px; color: var(--text2); }
+
+  .video-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  .video-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .video-card .video-label {
+    padding: 8px 14px;
+    font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--text2); border-bottom: 1px solid var(--border);
+  }
+  .video-card video {
+    width: 100%; display: block; background: #000;
+  }
+
+  /* ── Instruction editor ── */
+  .instruction-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 24px;
+  }
+  .instruction-section h3 {
+    font-size: 14px; font-weight: 600; margin-bottom: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .instruction-section h3 .task-idx { color: var(--text2); font-weight: 400; font-size: 12px; }
+
+  .instruction-input {
+    width: 100%; padding: 10px 14px;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); font-size: 14px;
+    outline: none; transition: border-color 0.2s; resize: none;
+    font-family: inherit;
+  }
+  .instruction-input:focus { border-color: var(--accent); }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 12px; }
+
+  button {
+    padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
+    border: none; cursor: pointer; transition: all 0.15s;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { background: var(--border); }
+  .btn-danger { background: var(--danger); color: #fff; }
+  .btn-small { padding: 5px 10px; font-size: 12px; }
+
+  /* ── Tasks management ── */
+  .tasks-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+  }
+  .tasks-section h3 { font-size: 14px; font-weight: 600; margin-bottom: 14px; }
+  .task-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 0; border-bottom: 1px solid var(--border);
+  }
+  .task-row:last-child { border-bottom: none; }
+  .task-row .task-id { font-size: 12px; color: var(--text2); min-width: 24px; text-align: right; }
+  .task-row input {
+    flex: 1; padding: 6px 10px;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 13px;
+    outline: none; font-family: inherit;
+  }
+  .task-row input:focus { border-color: var(--accent); }
+  .task-row .task-count { font-size: 11px; color: var(--text2); min-width: 30px; text-align: center; }
+
+  /* ── Toast ── */
+  .toast-container { position: fixed; top: 70px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
+  .toast {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 18px;
+    font-size: 13px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.4);
+    animation: slideIn 0.3s ease;
+    max-width: 360px;
+  }
+  .toast.success { border-left: 3px solid var(--success); }
+  .toast.error { border-left: 3px solid var(--danger); }
+  @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+  /* ── Tab ── */
+  .tabs { display: flex; gap: 0; margin-bottom: 24px; border-bottom: 1px solid var(--border); }
+  .tab {
+    padding: 10px 20px; font-size: 14px; font-weight: 500;
+    color: var(--text2); cursor: pointer; border-bottom: 2px solid transparent;
+    transition: all 0.2s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* ── Checkbox ── */
+  .ep-card .ep-check {
+    width: 16px; height: 16px;
+    border: 2px solid var(--border); border-radius: 4px;
+    cursor: pointer; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.15s;
+  }
+  .ep-card .ep-check.checked { background: var(--accent); border-color: var(--accent); }
+  .ep-card .ep-check.checked::after { content: '✓'; font-size: 10px; color: #fff; font-weight: 700; }
+  .select-mode .ep-card .ep-check { display: flex; }
+
+  .toolbar { display: flex; gap: 8px; align-items: center; }
+  .toolbar label { font-size: 12px; color: var(--text2); display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .toolbar input[type="checkbox"] { accent-color: var(--accent); }
+
+  /* ── Loading ── */
+  .loading { display: flex; align-items: center; justify-content: center; height: 100%; }
+  .spinner { width: 32px; height: 32px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>LeRobot Visualizer</h1>
+  <div class="meta" id="headerMeta"></div>
+</div>
+
+<div class="container">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <h2>Episodes</h2>
+        <div class="toolbar">
+          <label><input type="checkbox" id="selectModeToggle" onchange="toggleSelectMode()"> 批量选择</label>
+        </div>
+      </div>
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="搜索 episode 或 instruction..." oninput="filterEpisodes()">
+      </div>
+      <div class="filter-row" id="filterRow"></div>
+    </div>
+    <div class="episode-list" id="episodeList">
+      <div class="loading"><div class="spinner"></div></div>
+    </div>
+    <div class="batch-bar" id="batchBar">
+      <div class="batch-info"><span id="batchCount">0</span> 个 episode 已选中</div>
+      <div class="batch-actions">
+        <input type="text" id="batchTaskInput" placeholder="输入新的 instruction..." style="flex:1;padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;outline:none;">
+        <button class="btn-primary btn-small" onclick="batchUpdateTask()">批量修改</button>
+        <button class="btn-secondary btn-small" onclick="clearSelection()">取消选择</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="main" id="mainContent">
+    <div class="empty-state">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15 10l5 5-5 5"/><path d="M4 4v7a4 4 0 004 4h12"/></svg>
+      <p>选择左侧的 episode 以查看详情</p>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+let datasetInfo = {};
+let allTasks = [];
+let allEpisodes = [];
+let selectedEpIdx = null;
+let activeFilter = null;
+let selectMode = false;
+let selectedSet = new Set();
+
+async function init() {
+  const [info, tasks, episodes] = await Promise.all([
+    fetch('/api/info').then(r => r.json()),
+    fetch('/api/tasks').then(r => r.json()),
+    fetch('/api/episodes').then(r => r.json()),
+  ]);
+  datasetInfo = info;
+  allTasks = tasks;
+  allEpisodes = episodes;
+
+  document.getElementById('headerMeta').innerHTML = `
+    <span><b>${info.total_episodes}</b> episodes</span>
+    <span><b>${info.total_frames?.toLocaleString()}</b> frames</span>
+    <span><b>${info.total_tasks}</b> tasks</span>
+    <span><b>${info.fps}</b> fps</span>
+    <span class="badge">${info.robot_type || 'robot'}</span>
+  `;
+
+  renderFilters();
+  renderEpisodeList();
+}
+
+function renderFilters() {
+  const row = document.getElementById('filterRow');
+  let html = `<div class="filter-chip ${!activeFilter ? 'active' : ''}" onclick="setFilter(null)">全部 (${allEpisodes.length})</div>`;
+  const taskCounts = {};
+  allEpisodes.forEach(ep => {
+    const t = ep.tasks[0] || '(none)';
+    taskCounts[t] = (taskCounts[t] || 0) + 1;
+  });
+  allTasks.forEach(t => {
+    const count = taskCounts[t.task] || 0;
+    html += `<div class="filter-chip ${activeFilter === t.task ? 'active' : ''}" onclick="setFilter('${escHtml(t.task)}')" title="${escHtml(t.task)}">${truncate(t.task, 30)} (${count})</div>`;
+  });
+  row.innerHTML = html;
+}
+
+function setFilter(task) {
+  activeFilter = task;
+  renderFilters();
+  filterEpisodes();
+}
+
+function filterEpisodes() {
+  const q = document.getElementById('searchInput').value.toLowerCase();
+  const filtered = allEpisodes.filter(ep => {
+    if (activeFilter && ep.tasks[0] !== activeFilter) return false;
+    if (q) {
+      const text = `${ep.episode_index} ${ep.tasks.join(' ')}`.toLowerCase();
+      if (!text.includes(q)) return false;
+    }
+    return true;
+  });
+  renderEpisodeList(filtered);
+}
+
+function renderEpisodeList(episodes) {
+  episodes = episodes || allEpisodes;
+  const container = document.getElementById('episodeList');
+  if (episodes.length === 0) {
+    container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text2);font-size:13px;">无匹配结果</div>';
+    return;
+  }
+  container.innerHTML = episodes.map(ep => `
+    <div class="ep-card ${selectedEpIdx === ep.episode_index ? 'selected' : ''}"
+         onclick="onEpClick(event, ${ep.episode_index})"
+         data-ep="${ep.episode_index}">
+      <div class="ep-check ${selectedSet.has(ep.episode_index) ? 'checked' : ''}"
+           onclick="event.stopPropagation(); toggleSelect(${ep.episode_index})"
+           style="display:${selectMode ? 'flex' : 'none'}"></div>
+      <div class="ep-idx">#${ep.episode_index}</div>
+      <div class="ep-info">
+        <div class="ep-task">${escHtml(ep.tasks[0] || '—')}</div>
+        <div class="ep-meta">${ep.length} frames · ${(ep.length / datasetInfo.fps).toFixed(1)}s</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function onEpClick(event, epIdx) {
+  if (selectMode) {
+    toggleSelect(epIdx);
+    return;
+  }
+  selectedEpIdx = epIdx;
+  renderEpisodeList(getFilteredEpisodes());
+  showEpisodeDetail(epIdx);
+}
+
+function getFilteredEpisodes() {
+  const q = document.getElementById('searchInput').value.toLowerCase();
+  return allEpisodes.filter(ep => {
+    if (activeFilter && ep.tasks[0] !== activeFilter) return false;
+    if (q && !`${ep.episode_index} ${ep.tasks.join(' ')}`.toLowerCase().includes(q)) return false;
+    return true;
+  });
+}
+
+function toggleSelectMode() {
+  selectMode = document.getElementById('selectModeToggle').checked;
+  selectedSet.clear();
+  updateBatchBar();
+  renderEpisodeList(getFilteredEpisodes());
+}
+
+function toggleSelect(epIdx) {
+  if (selectedSet.has(epIdx)) selectedSet.delete(epIdx);
+  else selectedSet.add(epIdx);
+  updateBatchBar();
+  renderEpisodeList(getFilteredEpisodes());
+}
+
+function clearSelection() {
+  selectedSet.clear();
+  updateBatchBar();
+  renderEpisodeList(getFilteredEpisodes());
+}
+
+function updateBatchBar() {
+  const bar = document.getElementById('batchBar');
+  bar.classList.toggle('visible', selectMode && selectedSet.size > 0);
+  document.getElementById('batchCount').textContent = selectedSet.size;
+}
+
+async function batchUpdateTask() {
+  const newText = document.getElementById('batchTaskInput').value.trim();
+  if (!newText) return toast('请输入新的 instruction', 'error');
+  if (!confirm(`确认将 ${selectedSet.size} 个 episode 的 instruction 修改为:\n"${newText}"?`)) return;
+
+  try {
+    const res = await fetch('/api/episodes/batch_update_task', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ episode_indices: [...selectedSet], new_task_text: newText }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      toast(data.message, 'success');
+      await refreshData();
+      clearSelection();
+    } else {
+      toast(data.detail || 'Error', 'error');
+    }
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+function showEpisodeDetail(epIdx) {
+  const ep = allEpisodes.find(e => e.episode_index === epIdx);
+  if (!ep) return;
+
+  const mainVideoUrl = `/api/video/main/${ep.main_video.chunk}/${ep.main_video.file}#t=${ep.main_video.from_ts.toFixed(2)},${ep.main_video.to_ts.toFixed(2)}`;
+  const wristVideoUrl = `/api/video/wrist/${ep.wrist_video.chunk}/${ep.wrist_video.file}#t=${ep.wrist_video.from_ts.toFixed(2)},${ep.wrist_video.to_ts.toFixed(2)}`;
+
+  const taskObj = allTasks.find(t => t.task === ep.tasks[0]);
+  const taskIdx = taskObj ? taskObj.task_index : '?';
+
+  document.getElementById('mainContent').innerHTML = `
+    <div class="detail-header">
+      <h2>Episode #${ep.episode_index}</h2>
+      <div class="ep-len">${ep.length} frames · ${(ep.length / datasetInfo.fps).toFixed(1)}s · task_index=${taskIdx}</div>
+    </div>
+
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('viewer', this)">视频查看</div>
+      <div class="tab" onclick="switchTab('tasks', this)">任务管理</div>
+    </div>
+
+    <div class="tab-content active" id="tab-viewer">
+      <div class="video-grid">
+        <div class="video-card">
+          <div class="video-label">Main Camera</div>
+          <video controls preload="metadata" src="${mainVideoUrl}"></video>
+        </div>
+        <div class="video-card">
+          <div class="video-label">Wrist Camera</div>
+          <video controls preload="metadata" src="${wristVideoUrl}"></video>
+        </div>
+      </div>
+
+      <div class="instruction-section">
+        <h3>Instruction <span class="task-idx">task_index: ${taskIdx}</span></h3>
+        <textarea class="instruction-input" id="instrInput" rows="2">${escHtml(ep.tasks[0] || '')}</textarea>
+        <div class="btn-row">
+          <button class="btn-primary" onclick="saveEpisodeInstruction(${ep.episode_index})">保存此 Episode</button>
+          <button class="btn-secondary" onclick="saveGlobalTask(${taskIdx})">修改所有相同任务的 Episode</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-tasks">
+      <div class="tasks-section">
+        <h3>所有任务 (${allTasks.length})</h3>
+        ${allTasks.map(t => {
+          const count = allEpisodes.filter(e => e.tasks[0] === t.task).length;
+          return `
+          <div class="task-row">
+            <div class="task-id">${t.task_index}</div>
+            <input type="text" value="${escHtml(t.task)}" id="taskInput_${t.task_index}">
+            <div class="task-count">${count} ep</div>
+            <button class="btn-primary btn-small" onclick="saveTaskText(${t.task_index})">保存</button>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function switchTab(tabId, el) {
+  el.parentElement.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  el.closest('.main').querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById('tab-' + tabId).classList.add('active');
+}
+
+async function saveEpisodeInstruction(epIdx) {
+  const newText = document.getElementById('instrInput').value.trim();
+  if (!newText) return toast('Instruction 不能为空', 'error');
+
+  try {
+    const res = await fetch('/api/episodes/update_task', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ episode_index: epIdx, new_task_text: newText }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      toast(data.message, 'success');
+      await refreshData();
+      showEpisodeDetail(epIdx);
+    } else {
+      toast(data.detail || 'Error', 'error');
+    }
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function saveGlobalTask(taskIdx) {
+  const newText = document.getElementById('instrInput').value.trim();
+  if (!newText) return toast('Instruction 不能为空', 'error');
+  const count = allEpisodes.filter(e => {
+    const t = allTasks.find(t => t.task === e.tasks[0]);
+    return t && t.task_index === taskIdx;
+  }).length;
+  if (!confirm(`确认将 task_index=${taskIdx} 的所有 ${count} 个 episode 修改为:\n"${newText}"?`)) return;
+
+  try {
+    const res = await fetch('/api/tasks/update', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ task_index: taskIdx, new_text: newText }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      toast(data.message, 'success');
+      await refreshData();
+      showEpisodeDetail(selectedEpIdx);
+    } else {
+      toast(data.detail || 'Error', 'error');
+    }
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function saveTaskText(taskIdx) {
+  const input = document.getElementById(`taskInput_${taskIdx}`);
+  const newText = input.value.trim();
+  if (!newText) return toast('任务文本不能为空', 'error');
+
+  try {
+    const res = await fetch('/api/tasks/update', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ task_index: taskIdx, new_text: newText }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      toast(data.message, 'success');
+      await refreshData();
+      if (selectedEpIdx !== null) showEpisodeDetail(selectedEpIdx);
+    } else {
+      toast(data.detail || 'Error', 'error');
+    }
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function refreshData() {
+  const [tasks, episodes] = await Promise.all([
+    fetch('/api/tasks').then(r => r.json()),
+    fetch('/api/episodes').then(r => r.json()),
+  ]);
+  allTasks = tasks;
+  allEpisodes = episodes;
+  renderFilters();
+  filterEpisodes();
+}
+
+function toast(msg, type = 'success') {
+  const container = document.getElementById('toastContainer');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  container.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function truncate(s, n) {
+  return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+init();
+</script>
+</body>
+</html>
