@@ -113,41 +113,20 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         raw_roots = cfg.dataset.root
         episodes = cfg.dataset.episodes if isinstance(cfg.dataset.episodes, dict) else None
 
-        if isinstance(raw_roots, list):
-            roots_list = raw_roots
-            first_root = raw_roots[0]
-        elif isinstance(raw_roots, str):
-            roots_list = None
-            first_root = raw_roots
-        else:
-            roots_list = None
-            first_root = None
-
+        first_root = raw_roots[0] if isinstance(raw_roots, list) else raw_roots
         first_meta = LeRobotDatasetMetadata(
-            repo_ids[0],
-            root=first_root,
-            revision=cfg.dataset.revision,
+            repo_ids[0], root=first_root, revision=cfg.dataset.revision,
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, first_meta)
 
-        if roots_list is not None:
-            dataset = MultiLeRobotDataset(
-                repo_ids,
-                roots=roots_list,
-                episodes=episodes,
-                delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
-                video_backend=cfg.dataset.video_backend,
-            )
-        else:
-            dataset = MultiLeRobotDataset(
-                repo_ids,
-                root=raw_roots,
-                episodes=episodes,
-                delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
-                video_backend=cfg.dataset.video_backend,
-            )
+        dataset = MultiLeRobotDataset(
+            repo_ids,
+            root=raw_roots,
+            episodes=episodes,
+            delta_timestamps=delta_timestamps,
+            image_transforms=image_transforms,
+            video_backend=cfg.dataset.video_backend,
+        )
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
             f"{pformat(dataset.repo_id_to_index, indent=2)}"

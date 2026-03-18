@@ -1749,8 +1749,7 @@ class MultiLeRobotDatasetMetadata:
             ep_data = ds.meta.episodes
             if ep_data is None:
                 continue
-            for i in range(len(ep_data)):
-                ep = ep_data[i]
+            for ep in ep_data:
                 combined["dataset_from_index"].append(ep["dataset_from_index"] + frame_offset)
                 combined["dataset_to_index"].append(ep["dataset_to_index"] + frame_offset)
             frame_offset += ds.num_frames
@@ -1818,8 +1817,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         repo_ids: list[str],
-        root: str | Path | None = None,
-        roots: list[str | Path] | None = None,
+        root: str | list[str | Path] | Path | None = None,
         episodes: dict | None = None,
         image_transforms: Callable | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
@@ -1831,12 +1829,12 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         self.repo_ids = repo_ids
         self.tolerances_s = tolerances_s if tolerances_s else dict.fromkeys(repo_ids, 0.0001)
 
-        if roots is not None:
-            if len(roots) != len(repo_ids):
+        if isinstance(root, list):
+            if len(root) != len(repo_ids):
                 raise ValueError(
-                    f"roots length ({len(roots)}) must match repo_ids length ({len(repo_ids)})"
+                    f"root length ({len(root)}) must match repo_ids length ({len(repo_ids)})"
                 )
-            self._roots = [Path(r) for r in roots]
+            self._roots = [Path(r) for r in root]
         else:
             shared_root = Path(root) if root else HF_LEROBOT_HOME
             self._roots = [shared_root / repo_id for repo_id in repo_ids]
@@ -1856,18 +1854,17 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
             for repo_id, ds_root in zip(repo_ids, self._roots, strict=True)
         ]
 
-        # Disable any data keys that are not common across all of the datasets. Note: we may relax this
-        # restriction in future iterations of this class. For now, this is necessary at least for being able
-        # to use PyTorch's default DataLoader collate function.
-        self.disabled_features = set()
-        intersection_features = set(self._datasets[0].features)
-        for ds in self._datasets:
-            intersection_features.intersection_update(ds.features)
+        self._meta = MultiLeRobotDatasetMetadata(self._datasets)
+        self.stats = self._meta.stats
+
+        # Reuse the common feature keys already computed by the metadata object.
+        intersection_features = self._meta._common_feature_keys
         if len(intersection_features) == 0:
             raise RuntimeError(
                 "Multiple datasets were provided but they had no keys common to all of them. "
                 "The multi-dataset functionality currently only keeps common keys."
             )
+        self.disabled_features = set()
         for repo_id, ds in zip(self.repo_ids, self._datasets, strict=True):
             extra_keys = set(ds.features).difference(intersection_features)
             if extra_keys:
@@ -1879,9 +1876,6 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
 
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
-
-        self._meta = MultiLeRobotDatasetMetadata(self._datasets)
-        self.stats = self._meta.stats
 
     @property
     def meta(self) -> MultiLeRobotDatasetMetadata:

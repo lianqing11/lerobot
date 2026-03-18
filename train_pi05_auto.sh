@@ -40,7 +40,7 @@ log_freq=10
 pretrained_path="lerobot/pi05_base"
 output_dir=""
 wandb_mode="auto"          # auto | on | off
-gradient_checkpointing=false
+gradient_checkpointing=true
 resume_dir=""
 dataset_input=""           # 单个目录 或 .txt 列表文件
 extra_args=()
@@ -132,10 +132,13 @@ use_wandb=false
 # 派生变量
 # =============================================================================
 job_name="pi05_${dataset_repo_id}"
+timestamp="$(date +%Y%m%d_%H%M%S)"
 if [[ -n "${resume_dir}" ]]; then
   output_dir="${resume_dir}"
 elif [[ -z "${output_dir}" ]]; then
-  output_dir="ckpt/pi05_${dataset_repo_id}_$(date +%Y%m%d_%H%M%S)"
+  output_dir="ckpt/pi05_${dataset_repo_id}_${timestamp}"
+else
+  output_dir="${output_dir}_${timestamp}"
 fi
 
 # =============================================================================
@@ -205,7 +208,7 @@ train_args=(
 )
 
 [[ "${gradient_checkpointing}" == "true" ]] && \
-  train_args+=(--policy.use_gradient_checkpointing=true)
+  train_args+=(--policy.gradient_checkpointing=true)
 
 [[ -n "${resume_dir}" ]] && \
   train_args+=(--resume=true)

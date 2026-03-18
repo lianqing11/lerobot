@@ -170,6 +170,8 @@ outputs/
 # Checkpoints & evaluation outputs
 ckpt/
 eval_outputs/
+full_train_*/
+checkpoints/
 
 # Translations
 *.mo
@@ -184,3 +186,4 @@ eval_outputs/
 transformers_lerobot/
 CLAUDE.md
 *txt
+.cursor
