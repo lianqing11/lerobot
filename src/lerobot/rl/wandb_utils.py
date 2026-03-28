@@ -46,7 +46,13 @@ def cfg_to_group(
         f"seed:{cfg.seed}",
     ]
     if cfg.dataset is not None:
-        lst.append(f"dataset:{cfg.dataset.repo_id}")
+        if cfg.dataset.dataset_list_file is not None:
+            dataset_tag = Path(cfg.dataset.dataset_list_file).stem
+        elif isinstance(cfg.dataset.repo_id, list):
+            dataset_tag = "_".join(cfg.dataset.repo_id)
+        else:
+            dataset_tag = cfg.dataset.repo_id
+        lst.append(f"dataset:{dataset_tag}")
     if cfg.env is not None:
         lst.append(f"env:{cfg.env.type}")
     if truncate_tags:
@@ -67,8 +73,8 @@ def get_wandb_run_id_from_filesystem(log_dir: Path) -> str:
 
 
 def get_safe_wandb_artifact_name(name: str):
-    """WandB artifacts don't accept ":" or "/" in their name."""
-    return name.replace(":", "_").replace("/", "_")
+    """Sanitize name to only contain alphanumeric characters, dashes, underscores, and dots."""
+    return re.sub(r"[^a-zA-Z0-9\-_.]", "_", name)
 
 
 class WandBLogger:

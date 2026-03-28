@@ -30,7 +30,7 @@ from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.utils import cycle
+from lerobot.configs.default import _parse_dataset_list_file
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -342,37 +342,58 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
-        shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
-    else:
-        shuffle = True
-        sampler = None
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
-        sampler=sampler,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
-    )
-
-    # Prepare everything with accelerator
+    # Prepare policy, optimizer, lr_scheduler once
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
-    dl_iter = cycle(dataloader)
+    policy, optimizer, lr_scheduler = accelerator.prepare(policy, optimizer, lr_scheduler)
+
+    def _epoch_dataloader_iter():
+        """Yield batches, re-reading dataset_list_file and rebuilding dataloader every epoch."""
+        _ds = dataset
+        epoch = 0
+        while True:
+            if epoch > 0 and cfg.dataset.dataset_list_file is not None:
+                repo_ids, roots = _parse_dataset_list_file(cfg.dataset.dataset_list_file)
+                cfg.dataset.repo_id = repo_ids if len(repo_ids) > 1 else repo_ids[0]
+                cfg.dataset.root = roots if len(roots) > 1 else roots[0]
+                _ds = make_dataset(cfg)
+                if is_main_process:
+                    logging.info(
+                        f"[Epoch {epoch}] Reloaded dataset: "
+                        f"{_ds.num_frames} frames, {_ds.num_episodes} episodes"
+                    )
+
+            if hasattr(cfg.policy, "drop_n_last_frames"):
+                _sampler = EpisodeAwareSampler(
+                    _ds.meta.episodes["dataset_from_index"],
+                    _ds.meta.episodes["dataset_to_index"],
+                    episode_indices_to_use=_ds.episodes,
+                    drop_n_last_frames=cfg.policy.drop_n_last_frames,
+                    shuffle=True,
+                )
+                _shuffle = False
+            else:
+                _sampler = None
+                _shuffle = True
+
+            g = torch.Generator()
+            g.manual_seed((cfg.seed or 0) + epoch)
+
+            dl = torch.utils.data.DataLoader(
+                _ds,
+                num_workers=cfg.num_workers,
+                batch_size=cfg.batch_size,
+                shuffle=_shuffle and not cfg.dataset.streaming,
+                sampler=_sampler,
+                pin_memory=device.type == "cuda",
+                drop_last=False,
+                prefetch_factor=2 if cfg.num_workers > 0 else None,
+                generator=g,
+            )
+            dl = accelerator.prepare_data_loader(dl)
+            yield from dl
+            epoch += 1
+
+    dl_iter = _epoch_dataloader_iter()
 
     policy.train()
 

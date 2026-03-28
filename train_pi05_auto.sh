@@ -35,7 +35,7 @@ set -euo pipefail
 export http_proxy=http://100.68.175.233:3128; export https_proxy=http://100.68.175.233:3128
 batch_size=16
 steps=50000
-save_freq=1000
+save_freq=5000
 log_freq=10
 pretrained_path="lerobot/pi05_base"
 output_dir=""
@@ -110,16 +110,34 @@ fi
 num_machines="${MLP_WORKER_NUM:-1}"
 node_rank="${MLP_ROLE_INDEX:-0}"
 master_addr="${MLP_WORKER_0_HOST:-127.0.0.1}"
-master_port="${MLP_WORKER_0_PORT:-29500}"
+# MLP_WORKER_0_PORT 可能是逗号分隔的端口列表，取第一个
+raw_port="${MLP_WORKER_0_PORT:-29500}"
+master_port="${raw_port%%,*}"
 
-# GPU 数：优先使用平台注入值，否则用 nvidia-smi 检测
-if [[ -n "${MLP_WORKER_GPU:-}" ]]; then
-  num_gpus_local="${MLP_WORKER_GPU}"
-else
-  num_gpus_local=$(nvidia-smi -L 2>/dev/null | wc -l)
+# GPU 数：始终通过 nvidia-smi 自动检测本机可用卡数
+num_gpus_local=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [[ "${num_gpus_local}" -eq 0 ]]; then
+  echo "Error: 未检测到 GPU，请确认 nvidia-smi 可用。" >&2
+  exit 1
 fi
 
 num_processes=$(( num_gpus_local * num_machines ))
+
+# =============================================================================
+# 分布式网络配置（NCCL + PyTorch c10d）
+# =============================================================================
+export MASTER_ADDR="${master_addr}"
+export MASTER_PORT="${master_port}"
+
+if [[ "${num_machines}" -gt 1 ]]; then
+  # 网卡：优先用平台注入的 MLP_IFNAME，其次 NCCL_SOCKET_IFNAME，兜底 eth0
+  nccl_if="${MLP_IFNAME:-${NCCL_SOCKET_IFNAME:-eth0}}"
+  export NCCL_SOCKET_IFNAME="${nccl_if}"
+  export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${nccl_if}}"
+
+  export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+  export NCCL_TIMEOUT="${NCCL_TIMEOUT:-1800}"
+fi
 
 # =============================================================================
 # WandB 开关（多卡自动开启）
@@ -133,7 +151,7 @@ use_wandb=false
 # =============================================================================
 job_name="pi05_${dataset_repo_id}"
 timestamp="$(date +%Y%m%d_%H%M%S)"
-if [[ -n "${resume_dir}" ]]; then
+if [[ -n "${resume_dir}" && -z "${output_dir}" ]]; then
   output_dir="${resume_dir}"
 elif [[ -z "${output_dir}" ]]; then
   output_dir="ckpt/pi05_${dataset_repo_id}_${timestamp}"
@@ -166,8 +184,12 @@ if [[ "${node_rank}" -eq 0 ]]; then
   printf "  %-28s %s\n" "num_machines"           "${num_machines}"
   printf "  %-28s %s\n" "num_gpus_local"         "${num_gpus_local}"
   printf "  %-28s %s\n" "total_processes"        "${num_processes}"
-  [[ "${num_machines}" -gt 1 ]] && \
+  if [[ "${num_machines}" -gt 1 ]]; then
     printf "  %-28s %s\n" "master"               "${master_addr}:${master_port}"
+    printf "  %-28s %s\n" "NCCL_SOCKET_IFNAME"   "${NCCL_SOCKET_IFNAME:-<unset>}"
+    printf "  %-28s %s\n" "GLOO_SOCKET_IFNAME"   "${GLOO_SOCKET_IFNAME:-<unset>}"
+    printf "  %-28s %s\n" "NCCL_DEBUG"           "${NCCL_DEBUG:-<unset>}"
+  fi
   echo "  ──────────────────────────────────────────────────────────"
   printf "  %-28s %s\n" "batch_size (per GPU)"   "${batch_size}"
   printf "  %-28s %s\n" "steps"                  "${steps}"
@@ -210,8 +232,14 @@ train_args=(
 [[ "${gradient_checkpointing}" == "true" ]] && \
   train_args+=(--policy.gradient_checkpointing=true)
 
-[[ -n "${resume_dir}" ]] && \
-  train_args+=(--resume=true)
+if [[ -n "${resume_dir}" ]]; then
+  resume_config="${resume_dir%/}/pretrained_model/train_config.json"
+  if [[ ! -f "${resume_config}" ]]; then
+    echo "Error: 恢复训练所需的 ${resume_config} 不存在。" >&2
+    exit 1
+  fi
+  train_args+=(--resume=true --config_path="${resume_config}")
+fi
 
 [[ ${#extra_args[@]} -gt 0 ]] && \
   train_args+=("${extra_args[@]}")
@@ -221,11 +249,16 @@ train_args=(
 # =============================================================================
 echo "[节点 ${node_rank}] 启动训练: ${num_machines} 节点 × ${num_gpus_local} GPU = ${num_processes} 总进程"
 
-accelerate launch \
-  --num_processes="${num_processes}" \
-  --num_machines="${num_machines}" \
-  --machine_rank="${node_rank}" \
-  --main_process_ip="${master_addr}" \
-  --main_process_port="${master_port}" \
-  --mixed_precision=bf16 \
+accel_args=(
+  --num_processes="${num_processes}"
+  --num_machines="${num_machines}"
+  --machine_rank="${node_rank}"
+  --main_process_ip="${master_addr}"
+  --main_process_port="${master_port}"
+  --mixed_precision=bf16
+)
+
+[[ "${num_processes}" -gt 1 ]] && accel_args=(--multi_gpu "${accel_args[@]}")
+
+accelerate launch "${accel_args[@]}" \
   -m lerobot.scripts.lerobot_train "${train_args[@]}"
