@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
     --batch_size=*)           batch_size="${1#*=}" ;;
     --batch_size)             batch_size="$2"; shift ;;
     --steps=*)                steps="${1#*=}" ;;
-    --steps)                  steps="$2"; shift ;;
+  --steps)                  steps="$2"; shift ;;
     --save_freq=*)            save_freq="${1#*=}" ;;
     --save_freq)              save_freq="$2"; shift ;;
     --log_freq=*)             log_freq="${1#*=}" ;;

@@ -187,3 +187,9 @@ transformers_lerobot/
 CLAUDE.md
 *txt
 .cursor
+.omx
+aws
+vis_output
+visualization
+transformers_53
+text_adv

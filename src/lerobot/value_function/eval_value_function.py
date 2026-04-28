@@ -6,7 +6,7 @@ Reports per-task metrics: cross-entropy loss, MAE, value distribution stats,
 and bin-level accuracy. Optionally saves per-episode metrics for further analysis.
 
 Usage:
-    python eval_value_function.py \
+    python -m lerobot.value_function.eval_value_function \
         --value_checkpoint checkpoints/value_function/checkpoint_005000/value_function.pt \
         --dataset_list_file trainset_config/20260321_twotask_collect_more.txt \
         --output_file eval_results.json
@@ -16,32 +16,56 @@ import argparse
 import json
 import logging
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def load_value_function(checkpoint_path: str, device: str = "cuda"):
-    from lerobot.policies.pi05.value_function_pi05 import PI05ValueFunction
+def _resolve_checkpoint_path(checkpoint_path: str) -> Path:
+    checkpoint = Path(checkpoint_path)
+    if checkpoint.is_dir():
+        if (checkpoint / "value_function.pt").exists():
+            return checkpoint / "value_function.pt"
+        if (checkpoint / "training_state.pt").exists():
+            return checkpoint / "training_state.pt"
+    return checkpoint
 
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+def load_value_function(
+    checkpoint_path: str,
+    device: str = "cuda",
+    precision: str | None = None,
+    attn_implementation: str | None = None,
+):
+    from lerobot.value_function.value_function_pi05 import PI05ValueFunction
+
+    resolved = _resolve_checkpoint_path(checkpoint_path)
+    ckpt = torch.load(resolved, map_location="cpu", weights_only=False)
     config = ckpt["config"]
     model = PI05ValueFunction(
-        vlm_variant=config["vlm_variant"],
+        backbone_family=config.get("backbone_family", "paligemma"),
+        pretrained_model_name=config.get("pretrained_model_name", "Qwen/Qwen3-VL-2B-Instruct"),
+        vlm_variant=config.get("vlm_variant", "gemma_300m"),
         image_resolution=(224, 224),
-        precision=config.get("precision", "float32"),
+        precision=precision or config.get("precision", "float32"),
+        load_pretrained_backbone=False,
+        attn_implementation=attn_implementation or config.get("attn_implementation"),
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model = model.to(device)
     model.eval()
-    return model, config, ckpt["step"]
+
+    # Extract training-time normalization constants (saved by newer checkpoints).
+    train_norm = {
+        "max_length_per_task": ckpt.get("max_length_per_task"),
+    }
+    return model, config, ckpt["step"], train_norm
 
 
 def main():
@@ -52,6 +76,13 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--precision", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="auto",
+        choices=["auto", "flash_attention_2", "sdpa", "eager", "default"],
+    )
     parser.add_argument("--video_backend", type=str, default="pyav")
     parser.add_argument("--max_episodes", type=int, default=None, help="Limit episodes for quick eval")
     args = parser.parse_args()
@@ -59,22 +90,55 @@ def main():
     device = torch.device(args.device)
 
     # ── Load model ────────────────────────────────────────────────────
-    model, config, train_step = load_value_function(args.value_checkpoint, str(device))
-    logger.info(f"Loaded value function from step {train_step}, variant={config['vlm_variant']}")
+    model, config, train_step, train_norm = load_value_function(
+        args.value_checkpoint,
+        str(device),
+        precision=args.precision,
+        attn_implementation=args.attn_implementation,
+    )
+    logger.info(
+        "Loaded value function from step %s, backbone=%s",
+        train_step,
+        config.get("backbone_family", "paligemma"),
+    )
+    if train_norm["max_length_per_task"]:
+        logger.info("Using training max_length_per_task: %s", train_norm["max_length_per_task"])
+    else:
+        logger.warning(
+            "Checkpoint has no max_length_per_task — value targets will be normalized "
+            "by test-set episode lengths, which may differ from training."
+        )
 
     # ── Load tokenizer ────────────────────────────────────────────────
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
     # ── Load dataset ──────────────────────────────────────────────────
-    from train_value_function import ValueFunctionDataset, collate_fn, parse_dataset_list_file
+    from lerobot.value_function.train_value_function import (
+        ValueFunctionDataset,
+        collate_fn,
+        frame_indices_from_episode_infos,
+        load_value_processor,
+        prepare_value_inputs,
+        parse_dataset_list_file,
+    )
+
+    processor = load_value_processor(
+        config.get("backbone_family", "paligemma"),
+        config.get("pretrained_model_name", "Qwen/Qwen3-VL-2B-Instruct"),
+    )
 
     dataset_entries = parse_dataset_list_file(args.dataset_list_file)
-    vf_dataset = ValueFunctionDataset(
+    base_dataset = ValueFunctionDataset(
         dataset_entries, all_success=True, video_backend=args.video_backend,
+        max_length_per_task_override=train_norm["max_length_per_task"],
     )
+    vf_dataset = base_dataset
+
+    if args.max_episodes is not None:
+        limited_episode_infos = base_dataset.episode_infos[:args.max_episodes]
+        limited_frame_indices = frame_indices_from_episode_infos(limited_episode_infos)
+        vf_dataset = Subset(base_dataset, limited_frame_indices)
+        logger.info(
+            f"Quick eval enabled: {len(limited_episode_infos)} episodes, {len(limited_frame_indices)} frames"
+        )
 
     sample = vf_dataset[0]
     image_keys = [k for k in sample.keys() if "image" in k and isinstance(sample[k], torch.Tensor)]
@@ -95,16 +159,12 @@ def main():
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            images, img_masks = model.preprocess_images(batch, image_keys)
-            tasks = batch.get("task", [""] * args.batch_size)
-            encoded = tokenizer(
-                tasks, padding="max_length", max_length=200, truncation=True, return_tensors="pt",
+            prepared_inputs = prepare_value_inputs(
+                batch, processor, model, image_keys, device=str(device)
             )
-            tokens = encoded["input_ids"].to(device)
-            masks = encoded["attention_mask"].to(device).bool()
             target_bins = batch["value_target_bin"].long().to(device)
 
-            logits = model.forward(images, img_masks, tokens, masks)
+            logits = model.forward_from_prepared_inputs(prepared_inputs)
             per_sample_loss = F.cross_entropy(logits, target_bins, reduction="none")
 
             probs = F.softmax(logits, dim=-1)
@@ -114,6 +174,7 @@ def main():
             all_preds.append(pred_values.cpu().numpy())
             all_targets.append(target_values.cpu().numpy())
             all_losses.append(per_sample_loss.cpu().numpy())
+            tasks = batch.get("task", ["unknown"] * logits.shape[0])
             all_tasks.extend(tasks if isinstance(tasks, list) else [tasks] * logits.shape[0])
 
             ep_ids = batch.get("episode_index", torch.zeros(logits.shape[0]))
