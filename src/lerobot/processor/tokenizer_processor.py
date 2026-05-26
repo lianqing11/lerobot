@@ -81,6 +81,7 @@ class TokenizerProcessorStep(ObservationProcessorStep):
     padding_side: str = "right"
     padding: str = "max_length"
     truncation: bool = True
+    special_tokens: list[str] | None = None
 
     # Internal tokenizer instance (not part of the config)
     input_tokenizer: Any = field(default=None, init=False, repr=False)
@@ -113,6 +114,11 @@ class TokenizerProcessorStep(ObservationProcessorStep):
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "
                 "Pass a tokenizer object directly or a tokenizer name to auto-load."
+            )
+        if self.special_tokens:
+            self.input_tokenizer.add_special_tokens(
+                {"additional_special_tokens": list(self.special_tokens)},
+                replace_additional_special_tokens=False,
             )
 
     def get_task(self, transition: EnvTransition) -> list[str] | None:
@@ -290,6 +296,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         # Only save tokenizer_name if it was used to create the tokenizer
         if self.tokenizer_name is not None and self.tokenizer is None:
             config["tokenizer_name"] = self.tokenizer_name
+        if self.special_tokens is not None:
+            config["special_tokens"] = list(self.special_tokens)
 
         return config
 

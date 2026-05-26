@@ -48,12 +48,27 @@ else:
     PaliGemmaForConditionalGenerationWithPiGemma = None
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from lerobot.policies.pi05.processor_pi05 import (
+    PI05_PALIGEMMA_BASE_VOCAB_SIZE,
+    PI05_XVLA_ACTION_END,
+    PI05_XVLA_ACTION_PAD,
+    PI05_XVLA_ACTION_START,
+    PI05_XVLA_FRAME_END,
+    PI05_XVLA_FRAME_SEP,
+    PI05_XVLA_FRAME_START,
+    PI05_XVLA_SPECIAL_TOKENS,
+    _discretize_normalized_state,
+    format_pi05_ic_prompt,
+    format_pi05_xvla_ic_prompt,
+    next_obs_key,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
@@ -137,6 +152,40 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
     return att_2d_masks & pad_2d_masks
 
 
+def make_ic_all_frame_att_2d_masks(
+    prefix_pad_masks: Tensor,
+    prefix_frame_ids: Tensor,
+    suffix_pad_masks: Tensor,
+    suffix_frame_ids: Tensor,
+) -> Tensor:
+    bsize = prefix_pad_masks.shape[0]
+    prefix_len = prefix_pad_masks.shape[1]
+    suffix_len = suffix_pad_masks.shape[1]
+
+    if prefix_frame_ids.ndim == 1:
+        prefix_frame_ids = prefix_frame_ids[None, :].expand(bsize, -1)
+    if suffix_frame_ids.ndim == 1:
+        suffix_frame_ids = suffix_frame_ids[None, :].expand(bsize, -1)
+
+    prefix_query_frames = prefix_frame_ids[:, :, None]
+    prefix_key_frames = prefix_frame_ids[:, None, :]
+    suffix_query_frames = suffix_frame_ids[:, :, None]
+    suffix_key_frames = suffix_frame_ids[:, None, :]
+
+    prefix_prefix = prefix_key_frames <= prefix_query_frames
+    prefix_suffix = torch.zeros(bsize, prefix_len, suffix_len, dtype=torch.bool, device=prefix_pad_masks.device)
+    suffix_prefix = prefix_key_frames <= suffix_query_frames
+    suffix_suffix = suffix_key_frames == suffix_query_frames
+
+    top = torch.cat([prefix_prefix, prefix_suffix], dim=2)
+    bottom = torch.cat([suffix_prefix, suffix_suffix], dim=2)
+    att_2d_masks = torch.cat([top, bottom], dim=1)
+
+    pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
+    return att_2d_masks & pad_2d_masks
+
+
 def pad_vector(vector, new_dim):
     """Pad the last dimension of a vector to new_dim with zeros.
 
@@ -146,6 +195,34 @@ def pad_vector(vector, new_dim):
     if vector.shape[-1] >= new_dim:
         return vector
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
+
+
+class ActionEmbedder(nn.Module):
+    """Embed normalized action chunks as PaliGemma prefix tokens for IC context."""
+
+    def __init__(
+        self,
+        dim_action: int,
+        num_actions: int,
+        output_dim: int,
+        num_tokens: int,
+        hidden_dim: int | None = None,
+    ):
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.output_dim = output_dim
+        hidden_dim = hidden_dim or output_dim
+        self.net = nn.Sequential(
+            nn.Linear(dim_action * num_actions, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, num_tokens * output_dim),
+        )
+
+    def forward(self, actions: Tensor) -> Tensor:
+        leading = actions.shape[:-2]
+        action_tokens = self.net(actions.reshape(*leading, -1))
+        return action_tokens.reshape(*leading, self.num_tokens, self.output_dim)
 
 
 def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
@@ -446,6 +523,26 @@ class PaliGemmaWithExpertModel(
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.model.language_model.embed_tokens(tokens)
 
+    def resize_language_token_embeddings(self, vocab_size: int) -> None:
+        old_embed = self.paligemma.model.language_model.embed_tokens
+        if old_embed.num_embeddings >= vocab_size:
+            return
+
+        new_embed = nn.Embedding(
+            vocab_size,
+            old_embed.embedding_dim,
+            padding_idx=old_embed.padding_idx,
+            device=old_embed.weight.device,
+            dtype=old_embed.weight.dtype,
+        )
+        with torch.no_grad():
+            new_embed.weight[: old_embed.num_embeddings].copy_(old_embed.weight)
+            std = old_embed.weight.float().std().item()
+            nn.init.normal_(new_embed.weight[old_embed.num_embeddings :], mean=0.0, std=std)
+        self.paligemma.model.language_model.embed_tokens = new_embed
+        self.paligemma.config.text_config.vocab_size = vocab_size
+        self.paligemma.config._vocab_size = vocab_size  # noqa: SLF001
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -570,9 +667,28 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
         )
+        if config.ic_sequence_mode == "xvla":
+            self.paligemma_with_expert.resize_language_token_embeddings(
+                PI05_PALIGEMMA_BASE_VOCAB_SIZE + len(PI05_XVLA_SPECIAL_TOKENS)
+            )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        self.action_embedder = (
+            ActionEmbedder(
+                dim_action=config.max_action_dim,
+                num_actions=config.chunk_size,
+                output_dim=paligemma_config.width,
+                num_tokens=config.num_action_tokens,
+            )
+            if config.num_ic_frames > 1
+            else None
+        )
+        self.frame_position_embed = (
+            nn.Embedding(config.num_ic_frames, paligemma_config.width)
+            if config.ic_sequence_mode == "xvla" and config.use_frame_position_embed and config.num_ic_frames > 1
+            else None
+        )
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -678,6 +794,321 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
+    def _append_image_embeds(self, images, img_masks, embs, pad_masks, att_masks) -> None:
+        for img, img_mask in zip(images, img_masks, strict=True):
+
+            def image_embed_func(img):
+                return self.paligemma_with_expert.embed_image(img)
+
+            img_emb = self._apply_checkpoint(image_embed_func, img)
+            bsize, num_img_embs = img_emb.shape[:2]
+            embs.append(img_emb)
+            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            att_masks += [0] * num_img_embs
+
+    def embed_prefix_ic(
+        self,
+        images_by_frame,
+        img_masks_by_frame,
+        tokens,
+        masks,
+        context_actions,
+        next_images_by_frame=None,
+        next_img_masks_by_frame=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.action_embedder is None:
+            raise ValueError("PI05 IC requires action_embedder; set num_ic_frames > 1")
+
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        num_frames = len(images_by_frame)
+        num_context = num_frames - 1
+        self._append_image_embeds(images_by_frame[0], img_masks_by_frame[0], embs, pad_masks, att_masks)
+
+        embedder_dtype = next(self.action_embedder.parameters()).dtype
+        if self.config.zero_ic_actions:
+            context_actions = torch.zeros_like(context_actions)
+        action_embeds = self.action_embedder(context_actions.to(dtype=embedder_dtype))
+        for frame_idx in range(num_context):
+            if frame_idx > 0:
+                self._append_image_embeds(
+                    images_by_frame[frame_idx], img_masks_by_frame[frame_idx], embs, pad_masks, att_masks
+                )
+
+            action_emb = action_embeds[:, frame_idx]
+            embs.append(action_emb)
+            pad_masks.append(torch.ones(action_emb.shape[:2], dtype=torch.bool, device=action_emb.device))
+            att_masks += [0] * action_emb.shape[1]
+
+            if self.config.include_next_obs:
+                if next_images_by_frame is None or next_img_masks_by_frame is None:
+                    raise ValueError("PI05 IC include_next_obs=True requires explicit next.* image fields")
+                self._append_image_embeds(
+                    next_images_by_frame[frame_idx],
+                    next_img_masks_by_frame[frame_idx],
+                    embs,
+                    pad_masks,
+                    att_masks,
+                )
+
+        if not self.config.include_next_obs:
+            self._append_image_embeds(
+                images_by_frame[-1], img_masks_by_frame[-1], embs, pad_masks, att_masks
+            )
+
+        def lang_embed_func(tokens):
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+            lang_emb_dim = lang_emb.shape[-1]
+            return lang_emb * math.sqrt(lang_emb_dim)
+
+        lang_emb = self._apply_checkpoint(lang_embed_func, tokens)
+        embs.append(lang_emb)
+        pad_masks.append(masks)
+        att_masks += [0] * lang_emb.shape[1]
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = att_masks[None, :].expand(pad_masks.shape[0], len(att_masks))
+        return embs, pad_masks, att_masks
+
+    def _append_frame_ids(self, frame_ids, length: int, frame_idx: int) -> None:
+        frame_ids.extend([frame_idx] * length)
+
+    def _xvla_token_id(self, token: str) -> int:
+        return PI05_PALIGEMMA_BASE_VOCAB_SIZE + PI05_XVLA_SPECIAL_TOKENS.index(token)
+
+    def _parse_xvla_token_frame_ids(self, tokens: Tensor, masks: Tensor) -> Tensor:
+        frame_start_id = self._xvla_token_id(PI05_XVLA_FRAME_START)
+        frame_end_id = self._xvla_token_id(PI05_XVLA_FRAME_END)
+        action_start_id = self._xvla_token_id(PI05_XVLA_ACTION_START)
+        action_end_id = self._xvla_token_id(PI05_XVLA_ACTION_END)
+
+        bsize, seq_len = tokens.shape
+        frame_ids = torch.zeros(bsize, seq_len, dtype=torch.long, device=tokens.device)
+        max_frame = self.config.num_ic_frames - 1
+        for batch_idx in range(bsize):
+            frame_idx = 0
+            after_action = False
+            for token_idx in range(seq_len):
+                if not bool(masks[batch_idx, token_idx]):
+                    continue
+                token_id = int(tokens[batch_idx, token_idx].item())
+                token_frame = min(frame_idx + int(after_action), max_frame)
+                frame_ids[batch_idx, token_idx] = token_frame
+                if token_id == frame_start_id:
+                    after_action = False
+                    frame_ids[batch_idx, token_idx] = frame_idx
+                elif token_id == action_start_id:
+                    after_action = True
+                    frame_ids[batch_idx, token_idx] = min(frame_idx + 1, max_frame)
+                elif token_id == action_end_id:
+                    frame_ids[batch_idx, token_idx] = min(frame_idx + 1, max_frame)
+                elif token_id == frame_end_id:
+                    frame_ids[batch_idx, token_idx] = token_frame
+                    frame_idx = min(frame_idx + 1, max_frame)
+                    after_action = False
+        return frame_ids
+
+    def _scatter_xvla_action_embeds(self, lang_emb: Tensor, tokens: Tensor, masks: Tensor, actions: Tensor) -> Tensor:
+        if self.action_embedder is None:
+            raise ValueError("PI05 xvla IC requires action_embedder; set num_ic_frames > 1")
+
+        context_actions = actions
+        if self.config.zero_ic_actions:
+            context_actions = torch.zeros_like(context_actions)
+        embedder_dtype = next(self.action_embedder.parameters()).dtype
+        action_embeds = self.action_embedder(context_actions.to(dtype=embedder_dtype)).to(dtype=lang_emb.dtype)
+        flat_action_embeds = action_embeds.reshape(action_embeds.shape[0], -1, action_embeds.shape[-1])
+
+        action_pad_id = self._xvla_token_id(PI05_XVLA_ACTION_PAD)
+        action_pad_masks = (tokens == action_pad_id) & masks
+        expected_tokens = flat_action_embeds.shape[1]
+        lang_emb = lang_emb.clone()
+        for batch_idx in range(tokens.shape[0]):
+            positions = action_pad_masks[batch_idx].nonzero(as_tuple=True)[0]
+            if positions.numel() != expected_tokens:
+                raise ValueError(
+                    f"PI05 xvla IC expected {expected_tokens} action pads, got {positions.numel()}"
+                )
+            lang_emb[batch_idx, positions] = flat_action_embeds[batch_idx]
+        return lang_emb
+
+    def _apply_frame_position_embeds(self, embs: Tensor, frame_ids: Tensor) -> Tensor:
+        if self.frame_position_embed is None:
+            return embs
+        return embs + self.frame_position_embed(frame_ids.clamp(max=self.config.num_ic_frames - 1)).to(
+            dtype=embs.dtype
+        )
+
+    def embed_prefix_ic_xvla(
+        self,
+        images_by_frame,
+        img_masks_by_frame,
+        tokens,
+        masks,
+        context_actions,
+        next_images_by_frame=None,
+        next_img_masks_by_frame=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.action_embedder is None:
+            raise ValueError("PI05 xvla IC requires action_embedder; set num_ic_frames > 1")
+
+        embs = []
+        pad_masks = []
+        frame_ids = []
+        num_frames = len(images_by_frame)
+        for frame_idx in range(num_frames):
+            before_len = sum(emb.shape[1] for emb in embs)
+            image_att_masks = []
+            self._append_image_embeds(
+                images_by_frame[frame_idx],
+                img_masks_by_frame[frame_idx],
+                embs,
+                pad_masks,
+                image_att_masks,
+            )
+            self._append_frame_ids(frame_ids, sum(emb.shape[1] for emb in embs) - before_len, frame_idx)
+            if self.config.include_next_obs and frame_idx < num_frames - 1:
+                if next_images_by_frame is None or next_img_masks_by_frame is None:
+                    raise ValueError("PI05 xvla IC include_next_obs=True requires explicit next.* image fields")
+                before_len = sum(emb.shape[1] for emb in embs)
+                next_att_masks = []
+                self._append_image_embeds(
+                    next_images_by_frame[frame_idx],
+                    next_img_masks_by_frame[frame_idx],
+                    embs,
+                    pad_masks,
+                    next_att_masks,
+                )
+                self._append_frame_ids(
+                    frame_ids, sum(emb.shape[1] for emb in embs) - before_len, frame_idx + 1
+                )
+
+        def lang_embed_func(tokens):
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+            lang_emb_dim = lang_emb.shape[-1]
+            return lang_emb * math.sqrt(lang_emb_dim)
+
+        lang_emb = self._apply_checkpoint(lang_embed_func, tokens)
+        lang_emb = self._scatter_xvla_action_embeds(lang_emb, tokens, masks, context_actions)
+        token_frame_ids = self._parse_xvla_token_frame_ids(tokens, masks)
+        embs.append(lang_emb)
+        pad_masks.append(masks)
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        image_frame_ids = torch.tensor(frame_ids, dtype=torch.long, device=pad_masks.device)
+        image_frame_ids = image_frame_ids[None, :].expand(tokens.shape[0], -1)
+        all_frame_ids = torch.cat([image_frame_ids, token_frame_ids], dim=1)
+        embs = self._apply_frame_position_embeds(embs, all_frame_ids)
+        return embs, pad_masks, all_frame_ids
+
+    def embed_prefix_ic_all_frames(
+        self,
+        images_by_frame,
+        img_masks_by_frame,
+        tokens_by_frame,
+        masks_by_frame,
+        actions,
+        next_images_by_frame=None,
+        next_img_masks_by_frame=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.action_embedder is None:
+            raise ValueError("PI05 all-frame IC requires action_embedder; set num_ic_frames > 1")
+
+        embs = []
+        pad_masks = []
+        frame_ids = []
+        num_frames = len(images_by_frame)
+
+        context_actions = actions[:, :-1]
+        if self.config.zero_ic_actions:
+            context_actions = torch.zeros_like(context_actions)
+        embedder_dtype = next(self.action_embedder.parameters()).dtype
+        action_embeds = self.action_embedder(context_actions.to(dtype=embedder_dtype))
+
+        def lang_embed_func(tokens):
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+            lang_emb_dim = lang_emb.shape[-1]
+            return lang_emb * math.sqrt(lang_emb_dim)
+
+        for frame_idx in range(num_frames):
+            before_len = sum(emb.shape[1] for emb in embs)
+            image_att_masks = []
+            self._append_image_embeds(
+                images_by_frame[frame_idx],
+                img_masks_by_frame[frame_idx],
+                embs,
+                pad_masks,
+                image_att_masks,
+            )
+            self._append_frame_ids(frame_ids, sum(emb.shape[1] for emb in embs) - before_len, frame_idx)
+
+            tokens = tokens_by_frame[:, frame_idx]
+            masks = masks_by_frame[:, frame_idx]
+            lang_emb = self._apply_checkpoint(lang_embed_func, tokens)
+            embs.append(lang_emb)
+            pad_masks.append(masks)
+            self._append_frame_ids(frame_ids, lang_emb.shape[1], frame_idx)
+
+            if frame_idx < num_frames - 1:
+                action_emb = action_embeds[:, frame_idx]
+                embs.append(action_emb)
+                pad_masks.append(torch.ones(action_emb.shape[:2], dtype=torch.bool, device=action_emb.device))
+                self._append_frame_ids(frame_ids, action_emb.shape[1], frame_idx + 1)
+                if self.config.include_next_obs:
+                    if next_images_by_frame is None or next_img_masks_by_frame is None:
+                        raise ValueError("PI05 all-frame IC include_next_obs=True requires explicit next.* image fields")
+                    before_len = sum(emb.shape[1] for emb in embs)
+                    next_att_masks = []
+                    self._append_image_embeds(
+                        next_images_by_frame[frame_idx],
+                        next_img_masks_by_frame[frame_idx],
+                        embs,
+                        pad_masks,
+                        next_att_masks,
+                    )
+                    self._append_frame_ids(
+                        frame_ids, sum(emb.shape[1] for emb in embs) - before_len, frame_idx + 1
+                    )
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        frame_ids = torch.tensor(frame_ids, dtype=torch.long, device=pad_masks.device)
+        return embs, pad_masks, frame_ids
+
+    def embed_suffix_all_frames(self, noisy_actions, timestep):
+        bsize, num_frames, chunk_size = noisy_actions.shape[:3]
+        flat_actions = noisy_actions.reshape(bsize, num_frames * chunk_size, noisy_actions.shape[-1])
+
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.action_in_proj.out_features,
+            min_period=self.config.min_period,
+            max_period=self.config.max_period,
+            device=timestep.device,
+        )
+        time_emb = time_emb.type(dtype=timestep.dtype)
+
+        def action_proj_func(flat_actions):
+            return self.action_in_proj(flat_actions)
+
+        action_emb = self._apply_checkpoint(action_proj_func, flat_actions)
+
+        def time_mlp_func(time_emb):
+            x = self.time_mlp_in(time_emb)
+            x = F.silu(x)
+            x = self.time_mlp_out(x)
+            return F.silu(x)
+
+        time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+        pad_masks = torch.ones(bsize, num_frames * chunk_size, dtype=torch.bool, device=noisy_actions.device)
+        frame_ids = torch.arange(num_frames, device=noisy_actions.device).repeat_interleave(chunk_size)
+        return action_emb, pad_masks, frame_ids, time_emb
+
     def embed_suffix(self, noisy_actions, timestep):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
@@ -780,6 +1211,202 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
+    def forward_ic_query_only(
+        self,
+        images_by_frame,
+        img_masks_by_frame,
+        tokens,
+        masks,
+        context_actions,
+        query_actions,
+        next_images_by_frame=None,
+        next_img_masks_by_frame=None,
+        noise=None,
+        time=None,
+    ) -> Tensor:
+        """IC training forward: context frames condition the query action loss only."""
+        if self.config.ic_loss_mode != "query_only":
+            raise NotImplementedError("PI05 all-frame IC loss is not implemented yet")
+
+        if noise is None:
+            noise = self.sample_noise(query_actions.shape, query_actions.device)
+
+        if time is None:
+            time = self.sample_time(query_actions.shape[0], query_actions.device)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * query_actions
+        u_t = noise - query_actions
+
+        if self.config.ic_sequence_mode == "xvla":
+            prefix_embs, prefix_pad_masks, prefix_frame_ids = self.embed_prefix_ic_xvla(
+                images_by_frame,
+                img_masks_by_frame,
+                tokens,
+                masks,
+                context_actions,
+                next_images_by_frame,
+                next_img_masks_by_frame,
+            )
+        else:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix_ic(
+                images_by_frame,
+                img_masks_by_frame,
+                tokens,
+                masks,
+                context_actions,
+                next_images_by_frame,
+                next_img_masks_by_frame,
+            )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+
+        if (
+            self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        if self.config.ic_sequence_mode == "xvla":
+            suffix_frame_ids = torch.full(
+                (suffix_pad_masks.shape[1],),
+                len(images_by_frame) - 1,
+                dtype=torch.long,
+                device=suffix_pad_masks.device,
+            )
+            att_2d_masks = make_ic_all_frame_att_2d_masks(
+                prefix_pad_masks,
+                prefix_frame_ids,
+                suffix_pad_masks,
+                suffix_frame_ids,
+            )
+        else:
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            return suffix_out
+
+        suffix_out = self._apply_checkpoint(
+            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        )
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
+
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        return F.mse_loss(u_t, v_t, reduction="none")
+
+    def forward_ic_all_frames(
+        self,
+        images_by_frame,
+        img_masks_by_frame,
+        tokens_by_frame,
+        masks_by_frame,
+        actions,
+        next_images_by_frame=None,
+        next_img_masks_by_frame=None,
+        noise=None,
+        time=None,
+    ) -> Tensor:
+        if self.config.ic_loss_mode != "all_frames":
+            raise ValueError(f"forward_ic_all_frames requires ic_loss_mode='all_frames', got {self.config.ic_loss_mode}")
+
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+
+        time_expanded = time[:, None, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        if self.config.ic_sequence_mode == "xvla":
+            prefix_embs, prefix_pad_masks, prefix_frame_ids = self.embed_prefix_ic_xvla(
+                images_by_frame,
+                img_masks_by_frame,
+                tokens_by_frame,
+                masks_by_frame,
+                actions[:, :-1],
+                next_images_by_frame,
+                next_img_masks_by_frame,
+            )
+        else:
+            prefix_embs, prefix_pad_masks, prefix_frame_ids = self.embed_prefix_ic_all_frames(
+                images_by_frame,
+                img_masks_by_frame,
+                tokens_by_frame,
+                masks_by_frame,
+                actions,
+                next_images_by_frame,
+                next_img_masks_by_frame,
+            )
+        suffix_embs, suffix_pad_masks, suffix_frame_ids, adarms_cond = self.embed_suffix_all_frames(x_t, time)
+
+        if (
+            self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_2d_masks = make_ic_all_frame_att_2d_masks(
+            prefix_pad_masks,
+            prefix_frame_ids,
+            suffix_pad_masks,
+            suffix_frame_ids,
+        )
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            return suffix_out
+
+        suffix_out = self._apply_checkpoint(
+            forward_func,
+            prefix_embs,
+            suffix_embs,
+            att_2d_masks_4d,
+            position_ids,
+            adarms_cond,
+        )
+        suffix_out = suffix_out.reshape(
+            actions.shape[0],
+            actions.shape[1],
+            actions.shape[2],
+            suffix_out.shape[-1],
+        )
+        suffix_out = suffix_out.to(dtype=torch.float32)
+
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
+
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        return F.mse_loss(u_t, v_t, reduction="none")
+
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
         self,
@@ -857,6 +1484,87 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        return x_t
+
+    @torch.no_grad()
+    def sample_actions_ic(
+        self,
+        images_by_frame,
+        img_masks_by_frame,
+        tokens,
+        masks,
+        context_actions,
+        next_images_by_frame=None,
+        next_img_masks_by_frame=None,
+        noise=None,
+        num_steps=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        if self._rtc_enabled():
+            raise NotImplementedError("PI05 IC inference does not support RTC yet")
+
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+
+        bsize = tokens.shape[0]
+        device = tokens.device
+        if noise is None:
+            noise = self.sample_noise(
+                (bsize, self.config.chunk_size, self.config.max_action_dim),
+                device,
+            )
+
+        if self.config.ic_sequence_mode == "xvla":
+            prefix_embs, prefix_pad_masks, prefix_frame_ids = self.embed_prefix_ic_xvla(
+                images_by_frame,
+                img_masks_by_frame,
+                tokens,
+                masks,
+                context_actions,
+                next_images_by_frame,
+                next_img_masks_by_frame,
+            )
+            prefix_key_frames = prefix_frame_ids[:, None, :]
+            prefix_query_frames = prefix_frame_ids[:, :, None]
+            prefix_att_2d_masks = (prefix_key_frames <= prefix_query_frames) & (
+                prefix_pad_masks[:, None, :] * prefix_pad_masks[:, :, None]
+            )
+        else:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix_ic(
+                images_by_frame,
+                img_masks_by_frame,
+                tokens,
+                masks,
+                context_actions,
+                next_images_by_frame,
+                next_img_masks_by_frame,
+            )
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "sdpa"  # noqa: SLF001
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        dt = -1.0 / num_steps
+        x_t = noise
+        for step in range(num_steps):
+            time = 1.0 + step * dt
+            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            v_t = self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=x_t,
+                timestep=time_tensor,
+            )
+            x_t = x_t + dt * v_t
 
         return x_t
 
@@ -1018,8 +1726,19 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            embed_key = "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+            if embed_key in remapped_state_dict:
+                target_weight = model.state_dict()[embed_key]
+                loaded_weight = remapped_state_dict[embed_key]
+                if loaded_weight.shape != target_weight.shape and loaded_weight.shape[1:] == target_weight.shape[1:]:
+                    expanded_weight = target_weight.clone()
+                    expanded_weight[: loaded_weight.shape[0]].copy_(loaded_weight)
+                    remapped_state_dict[embed_key] = expanded_weight
+
+            # IC adds a new trainable ActionEmbedder, so old PI0.5 checkpoints are expected
+            # to miss only those keys when IC is enabled.
+            load_strict = strict and model.config.num_ic_frames <= 1
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=load_strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1116,10 +1835,13 @@ class PI05Policy(PreTrainedPolicy):
 
     def reset(self):
         """Reset internal state - called when environment resets."""
+        ic_tokenizer = getattr(self, "_ic_tokenizer", None)
         self._action_queue = deque(maxlen=self.config.n_action_steps)
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._ic_history = deque(maxlen=max(0, self.config.num_ic_frames - 1))
+        self._ic_tokenizer = ic_tokenizer
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1136,6 +1858,27 @@ class PI05Policy(PreTrainedPolicy):
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _prepare_image_tensor(self, img: Tensor) -> Tensor:
+        device = next(self.parameters()).device
+        if img.device != device:
+            img = img.to(device)
+
+        if img.dtype != torch.float32:
+            img = img.to(torch.float32)
+
+        is_channels_first = img.shape[1] == 3
+        if is_channels_first:
+            img = img.permute(0, 2, 3, 1)
+
+        if img.shape[1:3] != self.config.image_resolution:
+            img = resize_with_pad_torch(img, *self.config.image_resolution)
+
+        img = img * 2.0 - 1.0
+
+        if is_channels_first:
+            img = img.permute(0, 3, 1, 2)
+        return img
 
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
@@ -1160,33 +1903,7 @@ class PI05Policy(PreTrainedPolicy):
 
         # Preprocess image features present in the batch
         for key in present_img_keys:
-            img = batch[key]
-
-            # Ensure tensor is on the same device as the model
-            if img.device != device:
-                img = img.to(device)
-
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
-
-            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
-
-            if is_channels_first:
-                # Convert [B, C, H, W] to [B, H, W, C] for processing
-                img = img.permute(0, 2, 3, 1)
-
-            # from openpi preprocess_observation_pytorch: Resize with padding if needed
-            if img.shape[1:3] != self.config.image_resolution:
-                img = resize_with_pad_torch(img, *self.config.image_resolution)
-
-            # Normalize from [0,1] to [-1,1] as expected by siglip
-            img = img * 2.0 - 1.0
-
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
-            if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+            img = self._prepare_image_tensor(batch[key])
 
             images.append(img)
             # Create mask (all ones for real images)
@@ -1203,10 +1920,321 @@ class PI05Policy(PreTrainedPolicy):
 
         return images, img_masks
 
+    def _preprocess_images_ic(self, batch: dict[str, Tensor]) -> tuple[list[list[Tensor]], list[list[Tensor]]]:
+        images_by_key = []
+        masks_by_key = []
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+        if len(present_img_keys) == 0:
+            raise ValueError(
+                f"All image features are missing from the batch. At least one expected. "
+                f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
+            )
+
+        device = next(self.parameters()).device
+        num_frames = None
+        for key in present_img_keys:
+            img = batch[key]
+            if img.ndim != 5:
+                raise ValueError(f"IC image feature {key} must have shape [B,K,C,H,W], got {img.shape}")
+            bsize, frames = img.shape[:2]
+            if num_frames is None:
+                num_frames = frames
+            elif frames != num_frames:
+                raise ValueError(f"IC image feature {key} has {frames} frames, expected {num_frames}")
+            flat = img.reshape(bsize * frames, *img.shape[2:])
+            flat = self._prepare_image_tensor(flat)
+            images_by_key.append(flat.reshape(bsize, frames, *flat.shape[1:]))
+            masks_by_key.append(torch.ones(bsize, frames, dtype=torch.bool, device=device))
+
+        for _ in missing_img_keys:
+            img = torch.ones_like(images_by_key[-1]) * -1
+            mask = torch.zeros_like(masks_by_key[-1])
+            images_by_key.append(img)
+            masks_by_key.append(mask)
+
+        return (
+            [[images[:, frame_idx] for images in images_by_key] for frame_idx in range(num_frames)],
+            [[masks[:, frame_idx] for masks in masks_by_key] for frame_idx in range(num_frames)],
+        )
+
+    def _preprocess_next_images_ic(
+        self, batch: dict[str, Tensor], num_context_frames: int
+    ) -> tuple[list[list[Tensor]], list[list[Tensor]]]:
+        if not self.config.include_next_obs:
+            return None, None
+
+        next_images_by_key = []
+        next_masks_by_key = []
+        device = next(self.parameters()).device
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+        if len(present_img_keys) == 0:
+            raise ValueError(
+                f"All image features are missing from the batch. At least one expected. "
+                f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
+            )
+
+        for key in present_img_keys:
+            next_key = next_obs_key(key)
+            if next_key not in batch:
+                raise ValueError(f"PI05 IC include_next_obs=True requires '{next_key}' in the batch")
+            img = batch[next_key]
+            if img.ndim != 5:
+                raise ValueError(f"IC next image feature {next_key} must have shape [B,K-1,C,H,W], got {img.shape}")
+            bsize, frames = img.shape[:2]
+            if frames != num_context_frames:
+                raise ValueError(
+                    f"IC next image feature {next_key} has {frames} frames, expected {num_context_frames}"
+                )
+            flat = img.reshape(bsize * frames, *img.shape[2:])
+            flat = self._prepare_image_tensor(flat)
+            next_images_by_key.append(flat.reshape(bsize, frames, *flat.shape[1:]))
+            next_masks_by_key.append(torch.ones(bsize, frames, dtype=torch.bool, device=device))
+
+        for _ in missing_img_keys:
+            img = torch.ones_like(next_images_by_key[-1]) * -1
+            mask = torch.zeros_like(next_masks_by_key[-1])
+            next_images_by_key.append(img)
+            next_masks_by_key.append(mask)
+
+        return (
+            [[images[:, frame_idx] for images in next_images_by_key] for frame_idx in range(num_context_frames)],
+            [[masks[:, frame_idx] for masks in next_masks_by_key] for frame_idx in range(num_context_frames)],
+        )
+
     def prepare_action(self, batch):
         """Pad action"""
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
         return actions
+
+    def _ic_enabled(self) -> bool:
+        return self.config.num_ic_frames > 1
+
+    def _split_ic_actions(self, actions: Tensor) -> tuple[Tensor, Tensor]:
+        actions = self._reshape_ic_actions(actions)
+        return actions[:, :-1], actions[:, -1]
+
+    def _reshape_ic_actions(self, actions: Tensor) -> Tensor:
+        bsize, total_steps, dim = actions.shape
+        expected_steps = self.config.num_ic_frames * self.config.chunk_size
+        if total_steps != expected_steps:
+            raise ValueError(
+                f"PI05 IC expected action length {expected_steps}, got {total_steps}. "
+                "Check action_delta_indices and dataset sampling."
+            )
+        return actions.reshape(bsize, self.config.num_ic_frames, self.config.chunk_size, dim)
+
+    def _extract_task_text(self, task) -> str:
+        if isinstance(task, list):
+            task = task[0]
+        task = str(task)
+        if task.startswith("Task:"):
+            task = task.removeprefix("Task:").strip()
+            for separator in [", State:", "; Demo", "; Query State:"]:
+                if separator in task:
+                    task = task.split(separator, 1)[0]
+                    break
+        return task
+
+    def _get_ic_tokenizer(self):
+        if getattr(self, "_ic_tokenizer", None) is None:
+            from transformers import AutoTokenizer
+
+            self._ic_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+            if self.config.ic_sequence_mode == "xvla":
+                self._ic_tokenizer.add_special_tokens(
+                    {"additional_special_tokens": list(PI05_XVLA_SPECIAL_TOKENS)},
+                    replace_additional_special_tokens=False,
+                )
+        return self._ic_tokenizer
+
+    def _tokenize_ic_prompt(
+        self, task: str, states: Tensor, next_states: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
+        tokenizer = self._get_ic_tokenizer()
+        discretized_states = _discretize_normalized_state(states)[0]
+        next_discretized_states = (
+            _discretize_normalized_state(next_states)[0] if next_states is not None else None
+        )
+        if self.config.ic_sequence_mode == "xvla":
+            prompt = format_pi05_xvla_ic_prompt(
+                task,
+                discretized_states,
+                num_action_tokens=self.config.num_action_tokens,
+                include_next_obs=self.config.include_next_obs,
+                use_frame_sep=self.config.use_frame_sep,
+                next_discretized_states=next_discretized_states,
+            )
+        else:
+            prompt = format_pi05_ic_prompt(
+                task,
+                discretized_states,
+                include_next_obs=self.config.include_next_obs,
+                next_discretized_states=next_discretized_states,
+            )
+        tokenized = tokenizer(
+            [prompt],
+            max_length=self.config.tokenizer_max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        device = next(self.parameters()).device
+        return (
+            tokenized["input_ids"].to(device),
+            tokenized["attention_mask"].to(device, dtype=torch.bool),
+        )
+
+    def _tokenize_ic_frame_prompts(
+        self, tasks, states: Tensor, next_states: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
+        tokenizer = self._get_ic_tokenizer()
+
+        bsize, num_frames = states.shape[:2]
+        if isinstance(tasks, str):
+            tasks = [tasks] * bsize
+        elif len(tasks) == 1 and bsize > 1:
+            tasks = list(tasks) * bsize
+        tasks = [self._extract_task_text(tasks[i]) for i in range(bsize)]
+
+        discretized_states = _discretize_normalized_state(states)
+        next_discretized_states = (
+            _discretize_normalized_state(next_states) if next_states is not None else None
+        )
+        prompts = [
+            format_pi05_ic_prompt(
+                tasks[batch_idx],
+                discretized_states[batch_idx, : frame_idx + 1],
+                include_next_obs=self.config.include_next_obs,
+                next_discretized_states=(
+                    next_discretized_states[batch_idx, :frame_idx]
+                    if next_discretized_states is not None
+                    else None
+                ),
+            )
+            for batch_idx in range(bsize)
+            for frame_idx in range(num_frames)
+        ]
+        tokenized = tokenizer(
+            prompts,
+            max_length=self.config.tokenizer_max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        device = next(self.parameters()).device
+        return (
+            tokenized["input_ids"].reshape(bsize, num_frames, -1).to(device),
+            tokenized["attention_mask"].reshape(bsize, num_frames, -1).to(device, dtype=torch.bool),
+        )
+
+    def _select_ic_history_entries(self) -> list[dict] | None:
+        num_context = self.config.num_ic_frames - 1
+        if len(self._ic_history) < num_context:
+            return None
+        history = list(self._ic_history)
+        stride = self.config.ic_stride or 1
+        if self.config.ic_demo_mode == "fixed_first":
+            return [history[0]] * num_context
+        if self.config.ic_demo_mode == "early":
+            indices = list(range(0, len(history), stride))[:num_context]
+            return [history[i] for i in indices] if len(indices) == num_context else None
+
+        indices = [len(history) - 1 - i * stride for i in range(num_context)]
+        if indices[-1] < 0:
+            return None
+        indices.reverse()
+        return [history[i] for i in indices]
+
+    def _build_ic_inference_inputs(self, batch: dict[str, Tensor]):
+        if not self._ic_enabled():
+            return None
+        if OBS_STATE not in batch or batch[OBS_STATE].shape[0] != 1:
+            return None
+
+        entries = self._select_ic_history_entries()
+        if entries is None:
+            return None
+
+        ic_batch = {}
+        for key in self.config.image_features:
+            if key not in batch:
+                continue
+            context_images = (
+                [batch[key][0].detach()] * len(entries)
+                if self.config.clone_query_as_demo
+                else [entry["images"][key] for entry in entries]
+            )
+            ic_batch[key] = torch.stack(
+                context_images + [batch[key][0].detach()],
+                dim=0,
+            ).unsqueeze(0)
+            if self.config.include_next_obs:
+                next_context_images = context_images[1:] + [batch[key][0].detach()]
+                ic_batch[next_obs_key(key)] = torch.stack(next_context_images, dim=0).unsqueeze(0)
+
+        context_states = (
+            [batch[OBS_STATE][0].detach()] * len(entries)
+            if self.config.clone_query_as_demo
+            else [entry["state"] for entry in entries]
+        )
+        states = torch.stack(context_states + [batch[OBS_STATE][0].detach()], dim=0).unsqueeze(0)
+        if self.config.include_next_obs:
+            ic_batch[next_obs_key(OBS_STATE)] = torch.stack(
+                context_states[1:] + [batch[OBS_STATE][0].detach()],
+                dim=0,
+            ).unsqueeze(0)
+        task = batch.get("task", [""])
+        tokens, masks = self._tokenize_ic_prompt(
+            self._extract_task_text(task),
+            states,
+            ic_batch.get(next_obs_key(OBS_STATE)),
+        )
+
+        context_actions = torch.stack([entry["action"] for entry in entries], dim=0).unsqueeze(0)
+        context_actions = pad_vector(context_actions, self.config.max_action_dim)
+        if self.config.zero_ic_actions:
+            context_actions = torch.zeros_like(context_actions)
+
+        images_by_frame, img_masks_by_frame = self._preprocess_images_ic(ic_batch)
+        next_images_by_frame, next_img_masks_by_frame = self._preprocess_next_images_ic(
+            ic_batch, self.config.num_ic_frames - 1
+        )
+        return (
+            images_by_frame,
+            img_masks_by_frame,
+            tokens,
+            masks,
+            context_actions.to(tokens.device),
+            next_images_by_frame,
+            next_img_masks_by_frame,
+        )
+
+    def _record_ic_history(self, batch: dict[str, Tensor], actions: Tensor) -> None:
+        if not self._ic_enabled() or actions.shape[0] != 1 or OBS_STATE not in batch:
+            return
+        if batch[OBS_STATE].shape[0] != 1:
+            return
+
+        action = actions[0].detach().clone()
+        if self.config.n_action_steps < action.shape[0]:
+            action[self.config.n_action_steps :] = 0
+
+        images = {
+            key: batch[key][0].detach().clone()
+            for key in self.config.image_features
+            if key in batch
+        }
+        if not images:
+            return
+        self._ic_history.append(
+            {
+                "images": images,
+                "state": batch[OBS_STATE][0].detach().clone(),
+                "action": action,
+            }
+        )
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -1219,7 +2247,8 @@ class PI05Policy(PreTrainedPolicy):
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            full_actions = self.predict_action_chunk(batch)
+            actions = full_actions[:, : self.config.n_action_steps]
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
@@ -1231,15 +2260,38 @@ class PI05Policy(PreTrainedPolicy):
         self.eval()
 
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        ic_inputs = self._build_ic_inference_inputs(batch)
+        if ic_inputs is not None:
+            (
+                images_by_frame,
+                img_masks_by_frame,
+                ic_tokens,
+                ic_masks,
+                context_actions,
+                next_images_by_frame,
+                next_img_masks_by_frame,
+            ) = ic_inputs
+            actions = self.model.sample_actions_ic(
+                images_by_frame,
+                img_masks_by_frame,
+                ic_tokens,
+                ic_masks,
+                context_actions,
+                next_images_by_frame,
+                next_img_masks_by_frame,
+                **kwargs,
+            )
+        else:
+            images, img_masks = self._preprocess_images(batch)
+            # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
+            actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
+        self._record_ic_history(batch, actions)
 
         return actions
 
@@ -1253,25 +2305,77 @@ class PI05Policy(PreTrainedPolicy):
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
 
-        # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        if self._ic_enabled():
+            images_by_frame, img_masks_by_frame = self._preprocess_images_ic(batch)
+            next_images_by_frame, next_img_masks_by_frame = self._preprocess_next_images_ic(
+                batch, self.config.num_ic_frames - 1
+            )
+            if self.config.ic_loss_mode == "query_only":
+                context_actions, query_actions = self._split_ic_actions(actions)
+                losses = self.model.forward_ic_query_only(
+                    images_by_frame,
+                    img_masks_by_frame,
+                    tokens,
+                    masks,
+                    context_actions,
+                    query_actions,
+                    next_images_by_frame,
+                    next_img_masks_by_frame,
+                )
+            elif self.config.ic_loss_mode == "all_frames":
+                if OBS_STATE not in batch:
+                    raise ValueError("PI05 all-frame IC requires observation.state in the batch")
+                ic_actions = self._reshape_ic_actions(actions)
+                if self.config.ic_sequence_mode == "xvla":
+                    tokens_by_frame, masks_by_frame = tokens, masks
+                else:
+                    tokens_by_frame, masks_by_frame = self._tokenize_ic_frame_prompts(
+                        batch.get("task", [""] * actions.shape[0]),
+                        batch[OBS_STATE],
+                        batch.get(next_obs_key(OBS_STATE)),
+                    )
+                losses = self.model.forward_ic_all_frames(
+                    images_by_frame,
+                    img_masks_by_frame,
+                    tokens_by_frame,
+                    masks_by_frame,
+                    ic_actions,
+                    next_images_by_frame,
+                    next_img_masks_by_frame,
+                )
+            else:
+                raise ValueError(f"Invalid ic_loss_mode: {self.config.ic_loss_mode}")
+        else:
+            images, img_masks = self._preprocess_images(batch)
+            # Compute loss (no separate state needed for PI05)
+            losses = self.model.forward(images, img_masks, tokens, masks, actions)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        losses = losses[..., :original_action_dim]
+        raw_losses = losses
+        if losses.ndim == 4 and self.config.ic_frame_loss_weights is not None:
+            frame_weights = torch.tensor(
+                self.config.ic_frame_loss_weights,
+                dtype=losses.dtype,
+                device=losses.device,
+            )
+            frame_weights = frame_weights / frame_weights.mean()
+            losses = losses * frame_weights[None, :, None, None]
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": losses.mean(dim=tuple(range(losses.ndim - 1))).detach().cpu().numpy().tolist(),
         }
+        if raw_losses.ndim == 4:
+            loss_dict["loss_per_frame"] = raw_losses.mean(dim=(0, 2, 3)).detach().cpu().numpy().tolist()
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = losses.mean(dim=tuple(range(1, losses.ndim)))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
@@ -1286,7 +2390,14 @@ class PI05Policy(PreTrainedPolicy):
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
+        modules_to_save = ["model.action_embedder"] if self.config.num_ic_frames > 1 else []
+        if (
+            self.config.num_ic_frames > 1
+            and self.config.ic_sequence_mode == "xvla"
+            and self.config.use_frame_position_embed
+        ):
+            modules_to_save.append("model.frame_position_embed")
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": modules_to_save,
         }

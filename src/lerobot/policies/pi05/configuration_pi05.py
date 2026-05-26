@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -81,6 +82,22 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # Same-episode in-context settings. Disabled by default.
+    num_ic_frames: int = 1
+    num_action_tokens: int = 4
+    include_next_obs: bool = True
+    ic_sequence_mode: Literal["legacy", "xvla"] = "legacy"
+    ic_loss_mode: Literal["query_only", "all_frames"] = "all_frames"
+    ic_stride: int | None = None
+    ic_sampling_mode: Literal["chain"] = "chain"
+    ic_gap_range: list[int] = field(default_factory=lambda: [0, 0])
+    ic_demo_mode: Literal["normal", "fixed_first", "early"] = "normal"
+    ic_frame_loss_weights: list[float] | None = None
+    zero_ic_actions: bool = False
+    clone_query_as_demo: bool = False
+    use_frame_sep: bool = False
+    use_frame_position_embed: bool = False
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -114,6 +131,48 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.num_ic_frames < 1:
+            raise ValueError(f"num_ic_frames must be >= 1, got {self.num_ic_frames}")
+
+        if self.num_action_tokens < 1:
+            raise ValueError(f"num_action_tokens must be >= 1, got {self.num_action_tokens}")
+
+        if self.ic_stride is not None and self.ic_stride < 1:
+            raise ValueError(f"ic_stride must be >= 1 when set, got {self.ic_stride}")
+
+        if self.ic_loss_mode not in {"query_only", "all_frames"}:
+            raise ValueError(f"Invalid ic_loss_mode: {self.ic_loss_mode}")
+
+        if self.ic_sequence_mode not in {"legacy", "xvla"}:
+            raise ValueError(f"Invalid ic_sequence_mode: {self.ic_sequence_mode}")
+
+        if self.ic_sampling_mode != "chain":
+            raise ValueError(f"PI05 IC currently supports only ic_sampling_mode='chain', got {self.ic_sampling_mode}")
+
+        if self.ic_demo_mode not in {"normal", "fixed_first", "early"}:
+            raise ValueError(f"Invalid ic_demo_mode: {self.ic_demo_mode}")
+
+        if len(self.ic_gap_range) != 2 or any(gap < 0 for gap in self.ic_gap_range):
+            raise ValueError(f"ic_gap_range must be two non-negative integers, got {self.ic_gap_range}")
+        if self.ic_gap_range[1] < self.ic_gap_range[0]:
+            raise ValueError(f"ic_gap_range max must be >= min, got {self.ic_gap_range}")
+        if self.ic_gap_range[0] != self.ic_gap_range[1]:
+            raise ValueError(
+                "PI05 IC currently supports fixed ic_gap_range only. "
+                "Set both values equal, for example [0, 0] or [4, 4]."
+            )
+
+        if self.ic_frame_loss_weights is not None and len(self.ic_frame_loss_weights) != self.num_ic_frames:
+            raise ValueError(
+                f"ic_frame_loss_weights must have length {self.num_ic_frames}, "
+                f"got {len(self.ic_frame_loss_weights)}"
+            )
+        if self.ic_frame_loss_weights is not None and sum(self.ic_frame_loss_weights) <= 0:
+            raise ValueError("ic_frame_loss_weights must sum to a positive value")
+
+        if self.num_ic_frames > 1 and self.tokenizer_max_length < 512:
+            self.tokenizer_max_length = 512
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
@@ -157,13 +216,45 @@ class PI05Config(PreTrainedConfig):
         )
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list | None:
+        if self.num_ic_frames <= 1:
+            return None
+        frame_indices = self._ic_frame_delta_indices
+        if not self.include_next_obs:
+            return frame_indices
+
+        next_indices = self._ic_next_observation_delta_indices
+        if next_indices == frame_indices[1:]:
+            return frame_indices
+        return frame_indices + next_indices
 
     @property
     def action_delta_indices(self) -> list:
+        if self.num_ic_frames > 1:
+            indices = []
+            for frame_offset in self._ic_frame_delta_indices:
+                indices.extend(frame_offset + i for i in range(self.chunk_size))
+            return indices
         return list(range(self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+    @property
+    def drop_n_first_frames(self) -> int:
+        if self.num_ic_frames <= 1:
+            return 0
+        return (self.num_ic_frames - 1) * self._ic_step
+
+    @property
+    def _ic_step(self) -> int:
+        return (self.ic_stride or self.chunk_size) + self.ic_gap_range[0]
+
+    @property
+    def _ic_frame_delta_indices(self) -> list[int]:
+        return [-(self.num_ic_frames - 1 - i) * self._ic_step for i in range(self.num_ic_frames)]
+
+    @property
+    def _ic_next_observation_delta_indices(self) -> list[int]:
+        return [frame_offset + self.chunk_size for frame_offset in self._ic_frame_delta_indices[:-1]]

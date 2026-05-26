@@ -362,12 +362,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         f"{_ds.num_frames} frames, {_ds.num_episodes} episodes"
                     )
 
-            if hasattr(cfg.policy, "drop_n_last_frames"):
+            drop_n_first_frames = int(getattr(cfg.policy, "drop_n_first_frames", 0))
+            drop_n_last_frames = int(getattr(cfg.policy, "drop_n_last_frames", 0))
+            if drop_n_first_frames > 0 or drop_n_last_frames > 0:
                 _sampler = EpisodeAwareSampler(
                     _ds.meta.episodes["dataset_from_index"],
                     _ds.meta.episodes["dataset_to_index"],
                     episode_indices_to_use=_ds.episodes,
-                    drop_n_last_frames=cfg.policy.drop_n_last_frames,
+                    drop_n_first_frames=drop_n_first_frames,
+                    drop_n_last_frames=drop_n_last_frames,
                     shuffle=True,
                 )
                 _shuffle = False
